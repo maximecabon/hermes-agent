@@ -104,6 +104,20 @@ class TestCodingContextBlock:
         assert "coding agent" not in _stable_prompt(agent)
 
 
+class TestHumanApprovalGuidance:
+    def test_injected_only_when_tool_is_available(self):
+        stable = _stable_prompt(
+            _make_agent(valid_tool_names=["request_human_approval"])
+        )
+        assert "Only an `approved` result authorizes" in stable
+        assert "ordinary clarification" in stable
+
+    def test_absent_without_tool(self):
+        assert "Only an `approved` result authorizes" not in _stable_prompt(
+            _make_agent(valid_tool_names=[])
+        )
+
+
 class TestTelegramRichMessagesHint:
     """Verify that TELEGRAM_RICH_MESSAGES_HINT is conditionally included."""
 

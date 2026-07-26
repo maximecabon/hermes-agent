@@ -199,6 +199,11 @@ def reset_current_observability_context(
     _approval_turn_id.reset(turn_token)
 
 
+def get_current_observability_context() -> tuple[str, str]:
+    """Return the active turn/tool IDs without changing native approval state."""
+    return _approval_turn_id.get(), _approval_tool_call_id.get()
+
+
 def get_current_session_key(default: str = "default") -> str:
     """Return the active session key, preferring context-local state.
 

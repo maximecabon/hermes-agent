@@ -63,6 +63,25 @@ Settings are resolved in this order (highest priority first):
 Secrets (API keys, bot tokens, passwords) go in `.env`. Everything else (model, terminal backend, compression settings, memory limits, toolsets) goes in `config.yaml`. When both are set, `config.yaml` wins for non-secret settings.
 :::
 
+### Human approval Telegram target
+
+`request_human_approval` mirrors explicit human gates to Telegram. By default it
+uses Telegram's official home channel configured with `/sethome`. To use a
+dedicated operator chat instead, set non-secret routing IDs in `config.yaml`:
+
+```yaml
+gateway:
+  human_approval:
+    telegram_chat_id: "123456789"
+    telegram_thread_id: "42"  # optional topic/thread
+    default_timeout_seconds: 3600
+    max_timeout_seconds: 86400
+```
+
+If neither `telegram_chat_id` nor a Telegram home channel is available, the
+request terminates as `telegram_unavailable`; Hermes never treats missing
+configuration, silence, timeout, restart, or delivery failure as approval.
+
 :::tip Org deployments
 An administrator can pin specific config and secret values that a standard user
 cannot override, via a system-level managed directory. See

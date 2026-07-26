@@ -813,6 +813,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # API call (e.g. a set_my_commands stall for certain tokens) cannot
         # blow the gateway's connect timeout (#46298).
         self._post_connect_task: Optional[asyncio.Task] = None
+        # Shared human-approval delivery worker. Requests are persisted outside
+        # profile homes, so this one Telegram adapter can serve every profile.
+        self._human_approval_task: Optional[asyncio.Task] = None
 
     def _mark_connected(self) -> None:
         self._drop_delayed_deliveries = False
@@ -3220,6 +3223,211 @@ class TelegramAdapter(BasePlatformAdapter):
                             self.name, topic_name, seed_err,
                         )
 
+    def _human_approval_target(self) -> tuple[Optional[str], Optional[str]]:
+        """Resolve the dedicated approval chat, then the official home channel."""
+        settings: Dict[str, Any] = {}
+        try:
+            from hermes_cli.config import cfg_get
+
+            configured = cfg_get("gateway.human_approval", {})
+            if isinstance(configured, dict):
+                settings = configured
+        except Exception:
+            settings = {}
+
+        explicit_chat = str(settings.get("telegram_chat_id") or "").strip()
+        if explicit_chat:
+            explicit_thread = str(settings.get("telegram_thread_id") or "").strip()
+            return explicit_chat, explicit_thread or None
+
+        home = getattr(self.config, "home_channel", None)
+        if home and str(getattr(home, "chat_id", "") or "").strip():
+            return str(home.chat_id), str(home.thread_id) if home.thread_id else None
+        return None, None
+
+    def _start_human_approval_worker(self) -> None:
+        task = getattr(self, "_human_approval_task", None)
+        if task and not task.done():
+            return
+        task = asyncio.ensure_future(self._human_approval_delivery_loop())
+        self._human_approval_task = task
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _human_approval_delivery_loop(self) -> None:
+        """Claim and deliver durable approval requests until disconnect."""
+        owner = f"telegram-{os.getpid()}-{id(self)}"
+        try:
+            from tools.human_approval import get_shared_store
+
+            store = get_shared_store()
+            while self._bot is not None and not self._should_drop_delayed_delivery():
+                try:
+                    from hermes_cli.config import cfg_get
+
+                    settings = cfg_get("gateway.human_approval", {})
+                    if not isinstance(settings, dict):
+                        settings = {}
+                    poll_interval = min(
+                        max(float(settings.get("poll_interval_seconds", 0.25)), 0.05),
+                        2.0,
+                    )
+                    lease_seconds = max(
+                        float(settings.get("delivery_lease_seconds", 30)), 5.0
+                    )
+                except (TypeError, ValueError):
+                    poll_interval, lease_seconds = 0.25, 30.0
+
+                target_chat, target_thread = self._human_approval_target()
+                claimed = await asyncio.to_thread(
+                    store.claim_next_delivery,
+                    owner=owner,
+                    telegram_chat_id=target_chat or "",
+                    telegram_thread_id=target_thread,
+                    lease_seconds=lease_seconds,
+                )
+                if claimed is None:
+                    await asyncio.sleep(poll_interval)
+                    continue
+
+                if not target_chat:
+                    await asyncio.to_thread(
+                        store.complete_delivery,
+                        claimed.request_id,
+                        owner=owner,
+                        origin_delivery=claimed.origin_delivery,
+                        telegram_delivery="failed",
+                        failure_state="telegram_unavailable",
+                        failure_code="telegram_approval_target_not_configured",
+                    )
+                    continue
+
+                await self._deliver_human_approval(
+                    store,
+                    claimed,
+                    owner=owner,
+                    target_chat=target_chat,
+                    target_thread=target_thread,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Never log request payloads or transport exception text here.
+            logger.error("[%s] Human approval delivery worker stopped", self.name)
+        finally:
+            if getattr(self, "_human_approval_task", None) is asyncio.current_task():
+                self._human_approval_task = None
+
+    @staticmethod
+    def _same_human_approval_destination(
+        record, target_chat: str, target_thread: Optional[str]
+    ) -> bool:
+        return (
+            record.origin_platform == "telegram"
+            and str(record.origin_chat_id or "") == str(target_chat or "")
+            and str(record.origin_thread_id or "") == str(target_thread or "")
+        )
+
+    async def _send_human_approval_origin(self, record) -> tuple[str, Optional[str]]:
+        if record.origin_delivery != "pending":
+            return record.origin_delivery, record.origin_message_id
+        if not record.origin_chat_id or record.origin_platform in {
+            "local", "cli", "tui", "desktop", "api_server", "acp"
+        }:
+            return "deferred_to_result", None
+
+        runner = getattr(self, "gateway_runner", None)
+        adapter_for_source = getattr(runner, "_adapter_for_source", None)
+        if not callable(adapter_for_source):
+            return "failed", None
+        try:
+            from gateway.session import SessionSource
+
+            source = SessionSource(
+                platform=Platform(record.origin_platform),
+                chat_id=str(record.origin_chat_id),
+                chat_type="dm",
+                thread_id=record.origin_thread_id,
+                profile=record.requester_profile,
+            )
+            origin_adapter = adapter_for_source(source)
+            if origin_adapter is None:
+                return "failed", None
+            metadata: Dict[str, Any] = {"notify": True}
+            if record.origin_thread_id:
+                metadata["thread_id"] = record.origin_thread_id
+            from tools.human_approval import format_origin_notice
+
+            result = await origin_adapter.send(
+                str(record.origin_chat_id),
+                format_origin_notice(record),
+                metadata=metadata,
+            )
+            if result.success:
+                return "delivered", result.message_id
+        except Exception:
+            pass
+        return "failed", None
+
+    async def _deliver_human_approval(
+        self,
+        store,
+        record,
+        *,
+        owner: str,
+        target_chat: str,
+        target_thread: Optional[str],
+    ) -> None:
+        deduplicated = self._same_human_approval_destination(
+            record, target_chat, target_thread
+        )
+        if deduplicated:
+            origin_delivery, origin_message_id = "same_as_telegram", None
+        else:
+            origin_delivery, origin_message_id = await self._send_human_approval_origin(
+                record
+            )
+
+        telegram_result = await self.send_human_approval_gate(
+            record,
+            chat_id=target_chat,
+            thread_id=target_thread,
+        )
+        telegram_delivery = "delivered" if telegram_result.success else "failed"
+        failure_state = None
+        failure_code = None
+        if origin_delivery not in {"delivered", "same_as_telegram", "deferred_to_result"}:
+            failure_state, failure_code = "delivery_failed", "origin_delivery_failed"
+        if not telegram_result.success:
+            failure_state, failure_code = "delivery_failed", "telegram_delivery_failed"
+
+        completed = await asyncio.to_thread(
+            store.complete_delivery,
+            record.request_id,
+            owner=owner,
+            origin_delivery=origin_delivery,
+            telegram_delivery=telegram_delivery,
+            origin_message_id=origin_message_id,
+            telegram_message_id=telegram_result.message_id,
+            failure_state=failure_state,
+            failure_code=failure_code,
+        )
+        if (
+            completed
+            and failure_state
+            and telegram_result.success
+            and telegram_result.message_id
+            and self._bot is not None
+        ):
+            try:
+                await self._bot.edit_message_reply_markup(
+                    chat_id=normalize_telegram_chat_id(target_chat),
+                    message_id=int(telegram_result.message_id),
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+
     def _start_post_connect_housekeeping(self) -> None:
         """Kick off deferred post-connect housekeeping in the background.
 
@@ -3696,6 +3904,7 @@ class TelegramAdapter(BasePlatformAdapter):
             self._mark_connected()
             mode = "webhook" if self._webhook_mode else "polling"
             logger.info("[%s] Connected to Telegram (%s mode)", self.name, mode)
+            self._start_human_approval_worker()
 
             # Start the persistent heartbeat loop in polling mode. Webhook mode
             # receives updates via incoming pushes — there is no long-poll
@@ -3858,6 +4067,14 @@ class TelegramAdapter(BasePlatformAdapter):
             post_connect_task.cancel()
             await asyncio.gather(post_connect_task, return_exceptions=True)
         self._post_connect_task = None
+
+        # Stop the cross-profile approval poller before the Bot API client is
+        # torn down so it cannot claim a request it can no longer deliver.
+        human_approval_task = getattr(self, "_human_approval_task", None)
+        if human_approval_task and not human_approval_task.done():
+            human_approval_task.cancel()
+            await asyncio.gather(human_approval_task, return_exceptions=True)
+        self._human_approval_task = None
 
         # Cancel the heartbeat before tearing down the app so the probe task
         # cannot fire get_me() into a half-shutdown bot client.
@@ -5011,6 +5228,54 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_exec_approval failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
 
+    async def send_human_approval_gate(
+        self,
+        record,
+        *,
+        chat_id: str,
+        thread_id: Optional[str],
+    ) -> SendResult:
+        """Send the durable gate with exactly Approuver and Refuser buttons."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        try:
+            from tools.human_approval import format_telegram_gate, telegram_button_specs
+
+            buttons = [
+                InlineKeyboardButton(label, callback_data=callback_data)
+                for label, callback_data in telegram_button_specs(record.request_id)
+            ]
+            keyboard = InlineKeyboardMarkup([buttons])
+            metadata: Dict[str, Any] = {"notify": True}
+            if thread_id:
+                metadata["thread_id"] = str(thread_id)
+            kwargs: Dict[str, Any] = {
+                "chat_id": normalize_telegram_chat_id(chat_id),
+                "text": format_telegram_gate(record),
+                "parse_mode": ParseMode.HTML,
+                "reply_markup": keyboard,
+                **self._notification_kwargs(metadata),
+                **self._link_preview_kwargs(),
+            }
+            kwargs.update(
+                self._thread_kwargs_for_send(
+                    chat_id,
+                    str(thread_id) if thread_id is not None else None,
+                    metadata,
+                    reply_to_mode=self._reply_to_mode,
+                )
+            )
+            # Do not fall back to the chat root when an approval topic is
+            # configured: the callback is authorized for this exact chat/thread.
+            # A missing topic must fail closed instead of moving the gate.
+            message = await self._bot.send_message(**kwargs)
+            return SendResult(success=True, message_id=str(message.message_id))
+        except Exception:
+            # Do not include transport errors in tool-visible results: they can
+            # contain URLs or credentials on misconfigured proxies.
+            logger.warning("[%s] human approval Telegram delivery failed", self.name)
+            return SendResult(success=False, error="human_approval_delivery_failed")
+
     async def send_slash_confirm(
         self, chat_id: str, title: str, message: str, session_key: str,
         confirm_id: str, metadata: Optional[Dict[str, Any]] = None,
@@ -5849,6 +6114,85 @@ class TelegramAdapter(BasePlatformAdapter):
                 query_thread_id=query_thread_id,
                 query_user_name=query_user_name,
             )
+            return
+
+        # --- Durable human approval callbacks (ha:<opaque-id>:a|r) ---
+        if data.startswith("ha:"):
+            from tools.human_approval import get_shared_store, parse_callback_data
+
+            parsed = parse_callback_data(data)
+            if parsed is None:
+                await query.answer(text="Données d’approbation invalides.")
+                return
+            request_id, decision = parsed
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ Vous n’êtes pas autorisé à décider.")
+                return
+
+            try:
+                result = await asyncio.to_thread(
+                    get_shared_store().resolve_request,
+                    request_id,
+                    decision=decision,
+                    decided_by=caller_id,
+                    telegram_chat_id=str(query_chat_id or ""),
+                    telegram_thread_id=(
+                        str(query_thread_id) if query_thread_id is not None else None
+                    ),
+                )
+            except Exception:
+                await query.answer(text="La décision n’a pas été enregistrée.")
+                return
+
+            if result.changed:
+                label = "Approuvé" if result.state == "approved" else "Refusé"
+                await query.answer(text=label)
+                original_text = str(getattr(query_message, "text", "") or "")
+                try:
+                    await query.edit_message_text(
+                        text=(
+                            f"{_html.escape(original_text)}\n\n"
+                            f"<b>Décision : {_html.escape(label)}</b>"
+                        ),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    try:
+                        await query.edit_message_reply_markup(reply_markup=None)
+                    except Exception:
+                        pass
+                return
+
+            if result.reason == "unauthorized_chat":
+                await query.answer(text="Cette demande n’est pas autorisée dans ce chat.")
+                return
+            if result.state == "expired":
+                message = "Cette demande a expiré."
+            elif result.state in {"approved", "refused"}:
+                message = "Cette demande est déjà résolue."
+            elif result.state in {"delivery_failed", "telegram_unavailable", "cancelled"}:
+                message = "Cette demande est fermée sans approbation."
+            elif result.reason == "unknown_request":
+                message = "Demande inconnue."
+            else:
+                message = "Cette demande n’est pas encore actionnable."
+            await query.answer(text=message)
+            if result.state in {
+                "expired", "approved", "refused", "delivery_failed",
+                "telegram_unavailable", "cancelled",
+            }:
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
             return
 
         # --- Exec approval callbacks (ea:choice:id) ---

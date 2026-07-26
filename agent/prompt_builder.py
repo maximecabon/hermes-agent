@@ -345,6 +345,16 @@ TASK_COMPLETION_GUIDANCE = (
     "is always better than inventing a result."
 )
 
+HUMAN_APPROVAL_GUIDANCE = (
+    "# Explicit human approval\n"
+    "Use `request_human_approval` when continuing requires an explicit human "
+    "authorization, sign-off, or Go/No-Go. Only an `approved` result authorizes "
+    "the exact `requested_action`; refusal, timeout, silence, restart, callback "
+    "mismatch, or delivery failure do not. Do not use this gate for tests, lint, "
+    "builds, reviewer checks, factual/technical verification, or ordinary "
+    "clarification (use `clarify` for the latter)."
+)
+
 # Universal parallel-tool-call guidance — applied to ALL models.
 #
 # Why this matters for cost: every assistant turn resends the entire

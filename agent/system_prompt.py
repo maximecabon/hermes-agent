@@ -31,6 +31,7 @@ from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
+    HUMAN_APPROVAL_GUIDANCE,
     KANBAN_GUIDANCE,
     MEMORY_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
@@ -223,6 +224,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(MEMORY_GUIDANCE)
     if "session_search" in agent.valid_tool_names:
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
+    if "request_human_approval" in agent.valid_tool_names:
+        tool_guidance.append(HUMAN_APPROVAL_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:
         tool_guidance.append(SKILLS_GUIDANCE)
     # Kanban worker/orchestrator lifecycle — only present when the

@@ -59,8 +59,8 @@ _HERMES_CORE_TOOLS = [
     # off every CLI/messaging/cron schema (narrow waist).
     # Session history search
     "session_search",
-    # Clarifying questions
-    "clarify",
+    # Clarification and explicit human authorization
+    "clarify", "request_human_approval",
     # Code execution + delegation
     "execute_code", "delegate_task",
     # Cronjob management
@@ -236,6 +236,12 @@ TOOLSETS = {
         "tools": ["clarify"],
         "includes": []
     },
+
+    "human_approval": {
+        "description": "Explicit fail-closed human approval mirrored to Telegram",
+        "tools": ["request_human_approval"],
+        "includes": []
+    },
     
     "code_execution": {
         "description": "Run Python scripts that call tools programmatically (reduces LLM round trips)",
@@ -358,7 +364,7 @@ TOOLSETS = {
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
             "todo", "memory",
-            "session_search", "clarify",
+            "session_search", "clarify", "request_human_approval",
             "execute_code", "delegate_task",
         ],
         "includes": [],
@@ -390,7 +396,7 @@ TOOLSETS = {
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
             "todo", "memory",
-            "session_search",
+            "session_search", "request_human_approval",
             "execute_code", "delegate_task",
         ],
         "includes": []
@@ -416,8 +422,8 @@ TOOLSETS = {
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
             # Planning & memory
             "todo", "memory",
-            # Session history search
-            "session_search",
+            # Session history and explicit human authorization
+            "session_search", "request_human_approval",
             # Code execution + delegation
             "execute_code", "delegate_task",
             # Cronjob management

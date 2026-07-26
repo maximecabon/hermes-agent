@@ -2967,6 +2967,19 @@ DEFAULT_CONFIG = {
         # works as a manual override and wins if set explicitly.
         "platform_connect_timeout": 30,
 
+        # Cross-profile explicit human gates. The Telegram platform's official
+        # home channel (/sethome) is used by default. Set telegram_chat_id only
+        # when approvals must go to a dedicated operator chat. These IDs are
+        # routing metadata, not bot credentials.
+        "human_approval": {
+            "telegram_chat_id": "",
+            "telegram_thread_id": "",
+            "default_timeout_seconds": 3600,
+            "max_timeout_seconds": 86400,
+            "poll_interval_seconds": 0.25,
+            "delivery_lease_seconds": 30,
+        },
+
         # Whether the gateway keeps writing the legacy sessions.json mirror of
         # its routing index. The primary copy lives in state.db (the
         # gateway_routing table). Default True for backward compatibility with
