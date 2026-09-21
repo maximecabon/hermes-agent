@@ -1885,6 +1885,81 @@ def get_human_question(conn: sqlite3.Connection, task_id: str, question_id: str)
     }
 
 
+def resume_human_answer(conn: sqlite3.Connection, task_id: str, answer: Any) -> bool:
+    """Resume one ``needs_input`` task from a correlated, idempotent answer.
+
+    The answer is validated before the write transaction.  Its ``answer_id`` is
+    an event-backed idempotency key: a byte-identical replay is a no-op, while a
+    divergent reuse is rejected.  This transition never claims or dispatches a
+    worker; ``recompute_ready`` runs only after the checkpoint is durable.
+    """
+    from tools.human_question_contract import HumanQuestionContractError, validate_human_answer
+
+    if not isinstance(answer, dict):
+        raise HumanQuestionContractError("invalid closed answer")
+    question_id = answer.get("question_id")
+    if not isinstance(question_id, str):
+        raise HumanQuestionContractError("invalid question_id")
+    stored = get_human_question(conn, task_id, question_id)
+    if stored is None:
+        raise HumanQuestionContractError("answer belongs to an unknown question")
+    normalized = validate_human_answer(answer, question=stored["question"])
+    task = get_task(conn, task_id)
+    if task is None:
+        raise HumanQuestionContractError("answer belongs to an unknown task")
+    expected_root = task.root_task_id or task.id
+    if normalized["task_id"] != task.id or normalized["root_task_id"] != expected_root:
+        raise HumanQuestionContractError("answer task/root correlation diverged")
+    if stored["root_task_id"] != expected_root:
+        raise HumanQuestionContractError("question task/root correlation diverged")
+
+    with write_txn(conn):
+        prior_rows = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'human_answer_resumed' "
+            "ORDER BY id ASC", (task_id,),
+        ).fetchall()
+        for prior in prior_rows:
+            payload = _json_dict(prior["payload"])
+            if payload.get("answer_id") != normalized["answer_id"]:
+                continue
+            if payload.get("answer_sha256") == normalized["answer_sha256"]:
+                return False
+            raise HumanQuestionContractError("answer_id replay diverged")
+
+        row = conn.execute(
+            "SELECT status, block_kind, root_task_id, repair_stage FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != "blocked" or row["block_kind"] != "needs_input":
+            return False
+        current_root = _row_get(row, "root_task_id") or task_id
+        if current_root != normalized["root_task_id"]:
+            raise HumanQuestionContractError("answer task/root correlation diverged")
+        landing_status = _landing_status_after_parents(conn, task_id)
+        changed = conn.execute(
+            "UPDATE tasks SET status = ?, current_run_id = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "consecutive_failures = 0, last_failure_error = NULL "
+            "WHERE id = ? AND status = 'blocked' AND block_kind = 'needs_input'",
+            (landing_status, task_id),
+        ).rowcount
+        if changed != 1:
+            return False
+        _append_event(
+            conn, task_id, "human_answer_resumed",
+            {
+                "answer_id": normalized["answer_id"],
+                "answer_sha256": normalized["answer_sha256"],
+                "question_id": normalized["question_id"],
+                "question_sha256": normalized["question_sha256"],
+                "root_task_id": normalized["root_task_id"],
+                "repair_stage": _row_get(row, "repair_stage"),
+                "status": landing_status,
+            },
+        )
+    recompute_ready(conn)
+    return True
+
+
 def _persist_human_question(
     conn: sqlite3.Connection, task_id: str, root_task_id: str, question: dict,
 ) -> dict:

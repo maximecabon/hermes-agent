@@ -16,10 +16,12 @@ from typing import Any
 
 
 HUMAN_QUESTION_SCHEMA = "kanban.human_question.v1"
+HUMAN_ANSWER_SCHEMA = "kanban.human_answer.v1"
 MAX_QUESTION_PROMPT_BYTES = 2_000
 MAX_QUESTION_CONTEXT_BYTES = 1_000
 MAX_CHOICE_BYTES = 200
 MAX_HUMAN_QUESTION_BYTES = 8_192
+MAX_ANSWER_BYTES = 4_000
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -33,6 +35,18 @@ _FIELDS = (
     "required",
     "context",
     "question_sha256",
+)
+_ANSWER_FIELDS = (
+    "schema_version",
+    "answer_id",
+    "task_id",
+    "root_task_id",
+    "question_id",
+    "question_sha256",
+    "answer_kind",
+    "status",
+    "value",
+    "answer_sha256",
 )
 
 
@@ -122,3 +136,48 @@ def validate_human_question(value: Any) -> dict[str, Any]:
     if len(canonical_json(result).encode("utf-8")) > MAX_HUMAN_QUESTION_BYTES:
         raise HumanQuestionContractError("question is too large")
     return result
+
+
+def validate_human_answer(value: Any, *, question: Any) -> dict[str, Any]:
+    """Validate a closed, question-bound answer before a Kanban resume write."""
+    normalized_question = validate_human_question(question)
+    item = _closed(value, _ANSWER_FIELDS)
+    if item["schema_version"] != HUMAN_ANSWER_SCHEMA:
+        raise HumanQuestionContractError("invalid answer schema_version")
+    if (
+        item["question_id"] != normalized_question["question_id"]
+        or item["question_sha256"] != normalized_question["question_sha256"]
+        or item["answer_kind"] != normalized_question["answer_kind"]
+    ):
+        raise HumanQuestionContractError("answer is bound to another question")
+    status = item["status"]
+    if type(status) is not str or status not in {"ANSWERED", "SKIPPED"}:
+        raise HumanQuestionContractError("invalid answer status")
+    if status == "SKIPPED":
+        if normalized_question["required"] or item["value"] is not None:
+            raise HumanQuestionContractError("a required question cannot be skipped")
+        answer_value = None
+    else:
+        answer_value = _text(item["value"], "answer.value", max_bytes=MAX_ANSWER_BYTES)
+        if (
+            normalized_question["answer_kind"] == "CHOICE"
+            and answer_value not in normalized_question["choices"]
+        ):
+            raise HumanQuestionContractError("answer choice is outside the closed question")
+    body = {
+        "schema_version": HUMAN_ANSWER_SCHEMA,
+        "answer_id": _identifier(item["answer_id"], "answer_id"),
+        "task_id": _identifier(item["task_id"], "task_id"),
+        "root_task_id": _identifier(item["root_task_id"], "root_task_id"),
+        "question_id": normalized_question["question_id"],
+        "question_sha256": normalized_question["question_sha256"],
+        "answer_kind": normalized_question["answer_kind"],
+        "status": status,
+        "value": answer_value,
+    }
+    digest = item["answer_sha256"]
+    if type(digest) is not str or _HASH_RE.fullmatch(digest) is None:
+        raise HumanQuestionContractError("invalid answer_sha256")
+    if digest != canonical_sha256(body):
+        raise HumanQuestionContractError("divergent answer_sha256")
+    return {**body, "answer_sha256": digest}
