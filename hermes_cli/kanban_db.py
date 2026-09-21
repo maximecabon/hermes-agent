@@ -982,6 +982,18 @@ CREATE TABLE IF NOT EXISTS task_events (
     created_at INTEGER NOT NULL
 );
 
+-- Validated Human Wait question for a needs_input transition. Lifecycle events
+-- retain only correlation identifiers/checksums, never prompt/context text.
+CREATE TABLE IF NOT EXISTS task_human_questions (
+    task_id         TEXT NOT NULL,
+    question_id     TEXT NOT NULL,
+    root_task_id    TEXT NOT NULL,
+    question_json   TEXT NOT NULL,
+    question_sha256 TEXT NOT NULL,
+    created_at      INTEGER NOT NULL,
+    PRIMARY KEY (task_id, question_id)
+);
+
 -- Historical attempt record. Each time the dispatcher claims a task, a
 -- new row is created here; claim state, PID, heartbeat, runtime cap,
 -- and structured summary all live on the run, not the task. Multiple
@@ -1055,6 +1067,7 @@ CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_human_questions_root  ON task_human_questions(root_task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
@@ -1854,6 +1867,43 @@ def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[
 
 def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
     return [Event.from_row(r) for r in _task_rows(conn, "task_events", task_id, "created_at ASC, id ASC")]
+
+
+def get_human_question(conn: sqlite3.Connection, task_id: str, question_id: str) -> Optional[dict]:
+    """Read one typed question with its immutable task/root correlation."""
+    row = conn.execute(
+        "SELECT task_id, root_task_id, question_json FROM task_human_questions "
+        "WHERE task_id = ? AND question_id = ?",
+        (task_id, question_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "task_id": row["task_id"],
+        "root_task_id": row["root_task_id"],
+        "question": _json_or(row["question_json"]),
+    }
+
+
+def _persist_human_question(
+    conn: sqlite3.Connection, task_id: str, root_task_id: str, question: dict,
+) -> dict:
+    """Persist a pre-validated question inside the atomic block transition."""
+    conn.execute(
+        "INSERT INTO task_human_questions "
+        "(task_id, question_id, root_task_id, question_json, question_sha256, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            task_id, question["question_id"], root_task_id,
+            json.dumps(question, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            question["question_sha256"], int(time.time()),
+        ),
+    )
+    return {
+        "question_id": question["question_id"],
+        "question_sha256": question["question_sha256"],
+        "root_task_id": root_task_id,
+    }
 
 
 def _insert_comment(
@@ -2970,15 +3020,20 @@ def edit_completed_task_result(
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+    human_question: Optional[dict] = None,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``transient`` still counts toward the loop breaker
     so a forever-flaky task escalates. True on any transition."""
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+    if human_question is not None:
+        from tools.human_question_contract import validate_human_question
+
+        human_question = validate_human_question(human_question)
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status, block_kind, block_recurrences, root_task_id FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if cur_row is None:
             return False
@@ -2987,6 +3042,8 @@ def block_task(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
         )
+        if human_question is not None and kind != "needs_input":
+            raise ValueError("a human_question is only valid for kind='needs_input'")
         sql = f"""
                 UPDATE tasks
                    SET status        = '{new_status}',
@@ -3003,6 +3060,10 @@ def block_task(
             params = (*params, int(expected_run_id))
         if conn.execute(sql, params).rowcount != 1:
             return False
+        if human_question is not None:
+            payload["human_question"] = _persist_human_question(
+                conn, task_id, str(_row_get(cur_row, "root_task_id") or task_id), human_question,
+            )
         run_id = _end_or_synthesize_run(
             conn, task_id, outcome="blocked", status="blocked", summary=reason, synthesize=bool(reason),
         )
