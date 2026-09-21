@@ -1750,6 +1750,10 @@ DEFAULT_CONFIG = {
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
         # crashed) for the same task/profile. Reassignment resets the streak.
         "failure_limit": 2,
+        # Bounded orange-loop repair budget. Routing/escalation consumers use
+        # these limits; persistence remains available even before that layer.
+        "max_depth": 3,
+        "max_rewrites": 2,
         # Worker stdout/stderr log rotation at spawn time (2 MiB + one backup). Raise to keep more
         # early failure evidence from long-running workers.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,

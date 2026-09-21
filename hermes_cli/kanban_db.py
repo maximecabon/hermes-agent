@@ -713,6 +713,12 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    # Durable bounded-repair state. Routing is intentionally owned by later
+    # orange-loop cards; this model only preserves the checkpoint.
+    repair_depth: int = 0
+    repair_round: int = 0
+    repair_stage: Optional[str] = None
+    root_task_id: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -743,6 +749,7 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract",
+    "repair_depth", "repair_round", "repair_stage", "root_task_id",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -943,7 +950,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Bounded orange-loop checkpoint. The state machine is deliberately not
+    -- implemented here; these fields only make it durable and migratable.
+    repair_depth         INTEGER NOT NULL DEFAULT 0,
+    repair_round         INTEGER NOT NULL DEFAULT 0,
+    repair_stage         TEXT,
+    root_task_id         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1234,6 +1247,8 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    repair_depth: int = 0, repair_round: int = 0, repair_stage: Optional[str] = None,
+    root_task_id: Optional[str] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1333,8 +1348,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract,
+                        repair_depth, repair_round, repair_stage, root_task_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1344,6 +1360,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        int(repair_depth), int(repair_round), repair_stage, root_task_id,
                     ),
                 )
                 for pid in parents:

@@ -815,6 +815,12 @@ _LATER_TASK_COLUMNS = (
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # Durable checkpoint for the bounded orange repair loop; defaults retain
+    # legacy tasks exactly and make the additive migration replay-safe.
+    ("repair_depth", "repair_depth INTEGER NOT NULL DEFAULT 0"),
+    ("repair_round", "repair_round INTEGER NOT NULL DEFAULT 0"),
+    ("repair_stage", "repair_stage TEXT"),
+    ("root_task_id", "root_task_id TEXT"),
 )
 
 _NOTIFY_SUB_COLUMNS = (
