@@ -2297,11 +2297,16 @@ def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
 ) -> Optional[Task]:
-    """Atomically transition ``ready -> running``.
+    """Recompute admission, then atomically transition ``ready -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
+    # Admission must observe newly-completed dependencies before it even
+    # considers a claim.  This keeps a task parked in ``todo`` from waiting for
+    # a dispatcher tick, and guarantees no worker/profile/LLM is selected
+    # until the dependency gate has made the task claimable.
+    recompute_ready(conn)
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -2332,9 +2337,12 @@ def claim_review_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
 ) -> Optional[Task]:
-    """Atomic ``review -> running`` (None when lost). Parents are re-checked
+    """Recompute admission then atomically ``review -> running`` (None when lost). Parents are re-checked
     (one may have reopened meanwhile) and a NEW run tracks the reviewer
     separately from the implementer."""
+    # Keep review admission under the same pre-claim dependency recomputation
+    # as the ready lane; a reopened parent must win before a reviewer starts.
+    recompute_ready(conn)
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)

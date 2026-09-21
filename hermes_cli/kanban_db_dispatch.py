@@ -183,7 +183,16 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
     except Exception:
-        pass
+        # ``os.WIF*`` is unavailable on Windows, but tests and callers can
+        # still hand us a POSIX-style wait status. Decode that portable shape
+        # so the rate-limit sentinel keeps its neutral routing semantics.
+        if raw >= 0 and raw & 0x7F == 0:
+            code = raw >> 8
+            if code == 0:
+                return ("clean_exit", 0)
+            if code == _kb.KANBAN_RATE_LIMIT_EXIT_CODE:
+                return ("rate_limited", code)
+            return ("nonzero_exit", code)
     return ("unknown", None)
 
 
@@ -2078,7 +2087,12 @@ def _resolve_hermes_argv() -> list[str]:
             return _hermes_path_argv(resolved_env_bin)
         return _module_hermes_argv()
 
-    hermes_bin = _safe_which_no_cwd("hermes") if _kb._IS_WINDOWS else shutil.which("hermes")
+    # Resolve through shutil first so an intentionally stripped PATH is
+    # observable and testable on every platform. On Windows, accept that
+    # result only after the explicit-PATH resolver has excluded cwd lookup.
+    hermes_bin = shutil.which("hermes")
+    if hermes_bin and _kb._IS_WINDOWS:
+        hermes_bin = _safe_which_no_cwd("hermes")
     if hermes_bin:
         return _hermes_path_argv(hermes_bin)
     return _module_hermes_argv()
