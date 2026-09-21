@@ -305,6 +305,31 @@
   font-weight: 500;
   color: color-mix(in srgb, var(--color-foreground) 80%, var(--color-muted-foreground));
 }
+.hermes-kanban-operator-badge {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.58rem !important;
+  letter-spacing: 0.03em;
+  padding: 0.05rem 0.3rem !important;
+  border: 1px solid var(--color-border);
+  color: var(--color-foreground);
+  background: color-mix(in srgb, var(--color-foreground) 7%, transparent);
+}
+.hermes-kanban-operator-badge--active {
+  border-color: color-mix(in srgb, #3fb97d 55%, var(--color-border));
+  background: color-mix(in srgb, #3fb97d 16%, transparent);
+}
+.hermes-kanban-operator-badge--waiting-human {
+  border-color: color-mix(in srgb, #d4b348 60%, var(--color-border));
+  background: color-mix(in srgb, #d4b348 17%, transparent);
+}
+.hermes-kanban-operator-badge--process-gone {
+  border-color: color-mix(in srgb, var(--color-destructive, #d14a4a) 65%, var(--color-border));
+  background: color-mix(in srgb, var(--color-destructive, #d14a4a) 13%, transparent);
+}
+.hermes-kanban-operator-badge--unknown,
+.hermes-kanban-operator-badge--frozen-confirmed {
+  color: var(--color-muted-foreground);
+}
 .hermes-kanban-unassigned {
   font-style: italic;
 }

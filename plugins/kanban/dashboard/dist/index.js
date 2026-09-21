@@ -617,6 +617,10 @@
     // (`board`) belongs to the selected slug.
     const boardData = kanbanBoard;
     const setBoardData = setKanbanBoard;
+    // Replaced from the current I03 worker projection on every board read.
+    // An unavailable or flag-off projection yields an empty map and therefore
+    // no extra UI.
+    const [operatorTelemetryByTaskId, setOperatorTelemetryByTaskId] = useState({});
     const [config, setConfig] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
@@ -668,13 +672,26 @@
       if (tenantFilter) qs.set("tenant", tenantFilter);
       if (includeArchived) qs.set("include_archived", "true");
       const url = qs.toString() ? `${API}/board?${qs}` : `${API}/board`;
-      return SDK.fetchJSON(withBoard(url, board))
-        .then(function (data) {
+      return Promise.all([
+        SDK.fetchJSON(withBoard(url, board)),
+        SDK.fetchJSON(withBoard(`${API}/workers/active`, board)).catch(function () { return { workers: [] }; }),
+      ])
+        .then(function ([data, workersData]) {
+          const telemetryByTaskId = {};
+          for (const worker of (workersData && workersData.workers) || []) {
+            if (!worker || typeof worker.task_id !== "string" || typeof worker.operator_state !== "string") continue;
+            telemetryByTaskId[worker.task_id] = {
+              operator_state: worker.operator_state,
+              activity: worker.activity && typeof worker.activity === "object" ? worker.activity : null,
+            };
+          }
           setBoardData(data);
+          setOperatorTelemetryByTaskId(telemetryByTaskId);
           cursorRef.current = data.latest_event_id || 0;
           setError(null);
         })
         .catch(function (err) {
+          setOperatorTelemetryByTaskId({});
           setError(String(err && err.message ? err.message : err));
         })
         .finally(function () { setLoading(false); });
@@ -1314,6 +1331,7 @@
         }),
         h(BoardColumns, {
           board: filteredBoard,
+          operatorTelemetryByTaskId,
           boardMeta: boardList.find(function (item) { return item.slug === board; }) || null,
           laneByProfile,
           selectedIds,
@@ -2802,6 +2820,7 @@
           laneByProfile: props.laneByProfile,
           selectedIds: props.selectedIds,
           failedIds: props.failedIds,
+          operatorTelemetryByTaskId: props.operatorTelemetryByTaskId,
           draggingTaskId: props.draggingTaskId,
           toggleSelected: props.toggleSelected,
           toggleRange: props.toggleRange,
@@ -2942,6 +2961,7 @@
                       key: tk.id, task: tk,
                       selected: props.selectedIds.has(tk.id),
                       failed: props.failedIds && props.failedIds.has(tk.id),
+                      operatorTelemetry: props.operatorTelemetryByTaskId && props.operatorTelemetryByTaskId[tk.id],
                       draggingTaskId: props.draggingTaskId,
                       draggingSource: props.draggingTaskId && props.selectedIds.has(props.draggingTaskId) && props.selectedIds.size > 1 && props.selectedIds.has(tk.id),
                       toggleSelected: props.toggleSelected,
@@ -2956,6 +2976,7 @@
                   key: tk.id, task: tk,
                   selected: props.selectedIds.has(tk.id),
                   failed: props.failedIds && props.failedIds.has(tk.id),
+                  operatorTelemetry: props.operatorTelemetryByTaskId && props.operatorTelemetryByTaskId[tk.id],
                   draggingTaskId: props.draggingTaskId,
                   draggingSource: props.draggingTaskId && props.selectedIds.has(props.draggingTaskId) && props.selectedIds.size > 1 && props.selectedIds.has(tk.id),
                   toggleSelected: props.toggleSelected,
@@ -2990,6 +3011,45 @@
     if (age >= tier.red)   return "hermes-kanban-card--stale-red";
     if (age >= tier.amber) return "hermes-kanban-card--stale-amber";
     return "";
+  }
+
+  const OPERATOR_STATE_CLASS = {
+    ACTIVE: "active",
+    WAITING_HUMAN: "waiting-human",
+    PROCESS_GONE: "process-gone",
+    UNKNOWN: "unknown",
+    FROZEN_CONFIRMED: "frozen-confirmed",
+  };
+  const OPERATOR_ACTIVITY_VALUES = {
+    runtime: new Set(["hermes", "codex_app_server"]),
+    tool: new Set(["terminal", "read_file", "write_file", "patch", "web_search", "web_extract", "browser", "execute_code", "exec_command", "apply_patch", "delegate_task", "other"]),
+    waiting_for: new Set(["provider", "tool", "approval", "input", "codex"]),
+    thread_status: new Set(["active", "idle", "notLoaded", "systemError"]),
+    error: new Set(["oauth_error", "auth_error", "timeout", "rate_limit", "tool_error", "runtime_error"]),
+  };
+
+  function formatOperatorState(operatorState, activity) {
+    const state = typeof operatorState === "string" ? operatorState : "";
+    if (!Object.prototype.hasOwnProperty.call(OPERATOR_STATE_CLASS, state)) return null;
+    const details = [];
+    const source = activity && typeof activity === "object" ? activity : {};
+    for (const [key, label] of [["runtime", "runtime"], ["tool", "tool"], ["waiting_for", "waiting"], ["thread_status", "thread"], ["error", "error"]]) {
+      if (OPERATOR_ACTIVITY_VALUES[key].has(source[key])) details.push(`${label}: ${source[key]}`);
+    }
+    return {
+      label: state,
+      className: OPERATOR_STATE_CLASS[state],
+      title: `Operator state: ${state}${details.length ? ` — ${details.join(" · ")}` : ""}`,
+    };
+  }
+
+  function OperatorStateBadge(props) {
+    const formatted = formatOperatorState(props.operatorState, props.activity);
+    if (!formatted) return null;
+    return h(Badge, {
+      className: cn("hermes-kanban-operator-badge", `hermes-kanban-operator-badge--${formatted.className}`),
+      title: formatted.title,
+    }, formatted.label);
   }
 
   function TaskCard(props) {
@@ -3046,6 +3106,7 @@
 
     const progress = t.progress;
     const needsAssignee = t.status === "ready" && !t.assignee;
+    const operatorTelemetry = props.operatorTelemetry;
 
     return h("div", {
       ref: cardRef,
@@ -3134,6 +3195,12 @@
                               ? tx(i18n, "needsAssigneeHint", "Dependencies are satisfied, but the dispatcher skips this task until you assign a profile.")
                               : "No profile assigned." },
                   tx(i18n, "unassigned", "unassigned")),
+            operatorTelemetry
+              ? h(OperatorStateBadge, {
+                  operatorState: operatorTelemetry.operator_state,
+                  activity: operatorTelemetry.activity,
+                })
+              : null,
             t.comment_count > 0
               ? h("span", { className: "hermes-kanban-count",
                             title: `${t.comment_count} comment${t.comment_count === 1 ? "" : "s"} on this task` }, "💬 ", t.comment_count)
