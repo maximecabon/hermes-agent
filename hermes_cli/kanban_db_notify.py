@@ -31,15 +31,15 @@ _SCALAR_TYPES = (str, int, float, bool)
 # ``(task_id, platform, chat_id, thread_id or "")`` against it.
 _SUB_KEY_WHERE = "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?"
 
-# The origin leg is deliberately narrower than generic notification delivery:
-# a correlated typed ``needs_input`` question must not keep re-posting into a
-# human conversation forever.  Its retry ledger lives in ``task_events`` so it
-# survives gateway restarts without a subscription-schema migration.  Attempt
-# one is immediate; failures retry after 1s then 5s, and the third failure is
-# durably terminal for that exact task/subscription/event correlation.
+# A correlated typed ``needs_input`` question must not keep re-posting into a
+# human conversation forever. Each delivery leg has a retry ledger in
+# ``task_events`` so it survives gateway restarts without a schema migration.
+# Attempt one is immediate; failures retry after 1s then 5s, and the third
+# failure is durably terminal for that exact task/subscription/event correlation.
 ORIGIN_WAKE_MAX_ATTEMPTS = 3
 _ORIGIN_WAKE_RETRY_DELAYS = (1, 5)
 _ORIGIN_WAKE_EVENT_KINDS = ("origin_wake_retry", "origin_exhausted")
+_TELEGRAM_WAKE_EVENT_KINDS = ("telegram_wake_retry", "telegram_exhausted")
 
 
 def _sub_key(task_id: str, platform: str, chat_id: str, thread_id: Optional[str]) -> tuple:
@@ -169,6 +169,100 @@ def settle_origin_wake_failure(
             "retry_at": retry_at,
         }
         _kb._append_event(conn, task_id, "origin_exhausted" if exhausted else "origin_wake_retry", payload)
+        if not exhausted:
+            _cas_cursor(conn, key, int(old_cursor), int(claimed_cursor))
+    return {"attempts": attempts, "retry_at": retry_at, "exhausted": exhausted}
+
+
+def telegram_wake_state(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    event_id: int,
+) -> dict[str, Any]:
+    """Durable retry/exhaustion state for one configured Telegram leg."""
+    key = _sub_key(task_id, "telegram", chat_id, thread_id)
+    rows = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? "
+        "AND kind IN (?, ?) ORDER BY id ASC",
+        (task_id, *_TELEGRAM_WAKE_EVENT_KINDS),
+    ).fetchall()
+    state = {"attempts": 0, "retry_at": 0, "exhausted": False}
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "null")
+        except (TypeError, ValueError):
+            continue
+        if not _origin_payload_matches(payload, key, event_id):
+            continue
+        state = {
+            "attempts": int(payload.get("attempts") or 0),
+            "retry_at": int(payload.get("retry_at") or 0),
+            "exhausted": row["kind"] == "telegram_exhausted",
+        }
+    return state
+
+
+def telegram_wake_retry_due(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    now: Optional[int] = None,
+) -> bool:
+    """Whether the oldest unseen typed question may reach Telegram now."""
+    cursor = _notify_cursor(conn, task_id, "telegram", chat_id, thread_id)
+    if cursor is None:
+        return False
+    rows = conn.execute(
+        "SELECT * FROM task_events WHERE task_id = ? AND id > ? AND kind = 'blocked' ORDER BY id ASC",
+        (task_id, cursor),
+    ).fetchall()
+    for row in rows:
+        event = _kb.Event.from_row(row)
+        if not _is_correlated_needs_input_event(event):
+            continue
+        state = telegram_wake_state(
+            conn, task_id=task_id, chat_id=chat_id, thread_id=thread_id, event_id=event.id,
+        )
+        if state["exhausted"]:
+            return False
+        return int(state["retry_at"] or 0) <= int(time.time() if now is None else now)
+    return True
+
+
+def settle_telegram_wake_failure(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    event_id: int,
+    claimed_cursor: int,
+    old_cursor: int,
+    now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Record one failed Telegram delivery and atomically rewind or exhaust it."""
+    key = _sub_key(task_id, "telegram", chat_id, thread_id)
+    at = int(time.time() if now is None else now)
+    with _kb.write_txn(conn):
+        state = telegram_wake_state(
+            conn, task_id=task_id, chat_id=chat_id, thread_id=thread_id, event_id=event_id,
+        )
+        attempts = int(state["attempts"]) + 1
+        exhausted = attempts >= ORIGIN_WAKE_MAX_ATTEMPTS
+        retry_at = 0 if exhausted else at + _ORIGIN_WAKE_RETRY_DELAYS[attempts - 1]
+        payload = {
+            "origin_event_id": int(event_id),
+            "subscription": list(key),
+            "attempts": attempts,
+            "retry_at": retry_at,
+            "leg": "telegram",
+        }
+        _kb._append_event(conn, task_id, "telegram_exhausted" if exhausted else "telegram_wake_retry", payload)
         if not exhausted:
             _cas_cursor(conn, key, int(old_cursor), int(claimed_cursor))
     return {"attempts": attempts, "retry_at": retry_at, "exhausted": exhausted}

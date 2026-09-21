@@ -251,10 +251,16 @@ class _Collector:
         if _adapter_for_subscription(self.runner, Platform(platform), sub, owner_profile or self.notifier_profile) is None:
             _warn_anchorless_thread_sub_once(sub, platform)
             return None
-        if not _kbn().origin_wake_retry_due(
-            conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
-            thread_id=sub.get("thread_id") or "",
-        ):
+        task = self.kb.get_task(conn, sub["task_id"])
+        # A Telegram subscription whose task was created outside Telegram is
+        # the configured mirror target. A Telegram-created task remains I10's
+        # origin leg even though its origin platform is also Telegram.
+        telegram_mirror = platform == "telegram" and ":telegram:" not in str(getattr(task, "session_id", "") or "").lower()
+        retry_due = _kbn().telegram_wake_retry_due if telegram_mirror else _kbn().origin_wake_retry_due
+        retry_kwargs = {"task_id": sub["task_id"], "chat_id": sub["chat_id"], "thread_id": sub.get("thread_id") or ""}
+        if not telegram_mirror:
+            retry_kwargs["platform"] = sub["platform"]
+        if not retry_due(conn, **retry_kwargs):
             return None
         old_cursor, cursor, events = _kbn().claim_unseen_events_for_sub(
             conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
@@ -262,7 +268,6 @@ class _Collector:
         )
         if not events:
             return None
-        task = self.kb.get_task(conn, sub["task_id"])
         human_questions: dict[int, dict] = {}
         for event in events:
             payload = event.payload or {}
@@ -281,6 +286,7 @@ class _Collector:
         return {
             "sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events,
             "task": task, "board": slug, "human_questions": human_questions,
+            "telegram_mirror": telegram_mirror,
         }
 
     def collect_board(self, slug: str) -> None:
@@ -480,6 +486,13 @@ class _KanbanNotification:
         self.sub = sub = d["sub"]
         self.task = task = d["task"]
         self.human_questions: dict[int, dict] = d.get("human_questions") or {}
+        self.is_telegram_mirror = bool(d.get("telegram_mirror"))
+        self.needs_input_event_id = next((
+            ev.id for ev in d["events"]
+            if ev.kind == "blocked"
+            and (ev.payload or {}).get("kind") == "needs_input"
+            and ev.id in self.human_questions
+        ), None)
         self.board_slug = d.get("board")
         self.platform_str = (sub["platform"] or "").lower()
         self.task_id = sub["task_id"]
@@ -536,12 +549,18 @@ class _KanbanNotification:
         await self.delivery_failed(fmt, (self.task_id,), drop_fmt, exc, True)
 
     async def _settle_origin_wake_failure(self) -> dict:
-        """Persist/retry one typed origin wake without an in-memory counter."""
+        """Persist/retry one typed delivery leg without an in-memory counter."""
         assert self.origin_event_id is not None
 
         def settle() -> dict:
             conn = _kbc().connect(board=self.board_slug)
             try:
+                if self.is_telegram_mirror:
+                    return _kbn().settle_telegram_wake_failure(
+                        conn, task_id=self.sub["task_id"], chat_id=self.sub["chat_id"],
+                        thread_id=self.sub.get("thread_id") or "", event_id=self.origin_event_id,
+                        claimed_cursor=self.d["cursor"], old_cursor=self.d.get("old_cursor", 0),
+                    )
                 return _kbn().settle_origin_wake_failure(
                     conn, task_id=self.sub["task_id"], platform=self.sub["platform"],
                     chat_id=self.sub["chat_id"], thread_id=self.sub.get("thread_id") or "",
@@ -571,12 +590,7 @@ class _KanbanNotification:
         """Set ``wake_kinds`` / ``session_key`` / ``synth`` for the wake paths."""
         task, sub = self.task, self.sub
         self.wake_kinds = {ev.kind for ev in self.d["events"] if ev.kind in _WAKE_KINDS} if self.wake_agent else set()
-        self.origin_event_id = next((
-            ev.id for ev in self.d["events"]
-            if ev.kind == "blocked"
-            and (ev.payload or {}).get("kind") == "needs_input"
-            and ev.id in self.human_questions
-        ), None)
+        self.origin_event_id = self.needs_input_event_id
         if not self.wake_kinds:
             return
         if self.is_push_adapter:
@@ -718,6 +732,15 @@ class _KanbanNotification:
                 ))
                 self.clear_failures()
             except Exception as exc:
+                if self.needs_input_event_id is not None:
+                    self.origin_event_id = self.needs_input_event_id
+                    state = await self._settle_origin_wake_failure()
+                    logger.warning(
+                        "kanban notifier: %s needs-input delivery failed for %s (attempt %d/%d, exhausted=%s): %s",
+                        self.platform_str, self.task_id, state["attempts"], _kbn().ORIGIN_WAKE_MAX_ATTEMPTS,
+                        state["exhausted"], exc,
+                    )
+                    return False
                 await self.delivery_failed(
                     "kanban notifier: send failed for %s on %s (attempt %d/%d): %s", (self.task_id, self.platform_str),
                     "kanban notifier: dropping subscription %s on %s after %d consecutive send failures", exc, False,
