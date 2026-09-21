@@ -362,6 +362,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         status_activity = codex_thread_status_activity(note)
         if status_activity is not None:
             agent._codex_thread_status, agent._activity_waiting_for = status_activity
+            agent._touch_activity("Codex thread status changed")
         handler = handlers.get(note.get("method") or "") if isinstance(note, dict) else None
         if handler is not None:
             params = note.get("params")

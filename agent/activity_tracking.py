@@ -48,6 +48,16 @@ def build_standard_agent_activity_snapshot(agent) -> dict:
     )
 
 
+def build_runtime_agent_activity_snapshot(agent) -> dict:
+    """Select the existing payload-free adapter for the active agent runtime."""
+    if getattr(agent, "api_mode", None) == "codex_app_server":
+        # Lazy import preserves the one-way module import graph at agent startup.
+        from agent.codex_runtime import build_codex_app_server_activity_snapshot
+
+        return build_codex_app_server_activity_snapshot(agent)
+    return build_standard_agent_activity_snapshot(agent)
+
+
 def _activity_lock(obj) -> "threading.Lock":
     """Lazy per-instance ``_turn_liveness_activity_lock`` (so ``__new__``/SimpleNamespace doubles work)."""
     _lock = getattr(obj, "_turn_liveness_activity_lock", None)
@@ -115,7 +125,7 @@ class ActivityTrackingMixin:
                     # fences late callbacks from reclaimed/retried runs.
                     from hermes_cli.kanban_db_dispatch import persist_current_worker_activity_snapshot
                     persist_current_worker_activity_snapshot(
-                        build_standard_agent_activity_snapshot(self), sequence=activity_sequence,
+                        build_runtime_agent_activity_snapshot(self), sequence=activity_sequence,
                     )
                 # Fold new operator notes into the running turn (OUT-OF-BAND steer).
                 inject_new_comments_from_env(self)

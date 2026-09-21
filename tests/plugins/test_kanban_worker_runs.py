@@ -15,14 +15,18 @@ import secrets
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from agent.activity_tracking import ActivityTrackingMixin
+from agent.codex_runtime import make_codex_app_server_event_bridge
 from hermes_cli import kanban_db as kb
 from agent.session_activity import normalize_agent_activity_snapshot
+from tools import kanban_tools
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +215,71 @@ def test_get_run_hides_derived_telemetry_when_the_opt_in_flag_is_off(client):
     body = client.get(f"/api/plugins/kanban/runs/{run_id}").json()["run"]
     assert "activity" not in body
     assert "operator_state" not in body
+
+
+@pytest.mark.parametrize(
+    ("status_type", "active_flags", "expected_waiting_for", "expected_operator_state"),
+    [
+        ("active", ["waitingOnApproval"], "approval", "WAITING_HUMAN"),
+        ("active", ["waitingOnUserInput"], "input", "WAITING_HUMAN"),
+        ("idle", [], None, "UNKNOWN"),
+        ("notLoaded", [], None, "UNKNOWN"),
+        ("systemError", [], None, "UNKNOWN"),
+    ],
+)
+def test_codex_thread_status_event_persists_latest_snapshot_and_api_state(
+    client,
+    monkeypatch,
+    status_type,
+    active_flags,
+    expected_waiting_for,
+    expected_operator_state,
+):
+    """A Codex status event uses the existing activity bridge, writer, and API projection."""
+    _enable_activity_api(monkeypatch)
+    monkeypatch.setattr(kanban_tools, "heartbeat_current_worker_from_env", lambda: True)
+    monkeypatch.setattr(kanban_tools, "inject_new_comments_from_env", lambda _agent: False)
+    with kb.connect() as conn:
+        task_id, run_id = _setup_running_task_with_run(
+            conn, title="codex activity", assignee="worker", worker_pid=12345,
+        )
+        conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id, task_id))
+        conn.commit()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+
+    agent = SimpleNamespace(
+        api_mode="codex_app_server",
+        _current_tool=None,
+        _last_activity_error=None,
+        session_input_tokens=0,
+        session_output_tokens=0,
+        session_total_tokens=0,
+        _api_call_count=1,
+        max_iterations=4,
+        context_compressor=None,
+        _persist_session_activity_if_due=lambda: None,
+    )
+    agent._touch_activity = ActivityTrackingMixin._touch_activity.__get__(agent, SimpleNamespace)
+
+    make_codex_app_server_event_bridge(agent)({
+        "method": "thread/status/changed",
+        "params": {"threadId": "thread-1", "status": {"type": status_type, "activeFlags": active_flags}},
+    })
+
+    with kb.connect() as conn:
+        row = conn.execute(
+            "SELECT activity_json, activity_sequence FROM task_runs WHERE id = ?", (run_id,),
+        ).fetchone()
+    snapshot = json.loads(row["activity_json"])
+    assert snapshot["runtime"] == "codex_app_server"
+    assert snapshot["thread_status"] == status_type
+    assert snapshot["waiting_for"] == expected_waiting_for
+    assert row["activity_sequence"] == 1
+
+    body = client.get(f"/api/plugins/kanban/runs/{run_id}").json()["run"]
+    assert body["activity"] == snapshot
+    assert body["operator_state"] == expected_operator_state
 
 
 # ---------------------------------------------------------------------------
