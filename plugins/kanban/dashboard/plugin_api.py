@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli.web_read_coalescing import coalesced_read
+from hermes_cli.active_sessions import _pid_liveness
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
@@ -865,6 +866,57 @@ except ImportError:
     _psutil = None  # type: ignore[assignment]
 
 
+def _run_activity_telemetry_enabled() -> bool:
+    """Keep run reads unchanged unless activity persistence is explicitly enabled."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        return bool((load_config_readonly().get("kanban") or {}).get("persist_run_activity", False))
+    except Exception:
+        return False
+
+
+def _redacted_run_activity(activity_json: Any) -> Optional[dict]:
+    """Normalize stored activity once more before it crosses the dashboard boundary."""
+    if isinstance(activity_json, str):
+        try:
+            activity_json = json.loads(activity_json)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(activity_json, dict) or activity_json.get("schema_version") != "agent_activity/v1":
+        return None
+    from agent.session_activity import normalize_agent_activity_snapshot
+    return normalize_agent_activity_snapshot(
+        runtime=activity_json.get("runtime"),
+        tool=activity_json.get("tool"),
+        waiting_for=activity_json.get("waiting_for"),
+        thread_status=activity_json.get("thread_status"),
+        error=activity_json.get("error"),
+        tokens=activity_json.get("tokens"),
+        limits=activity_json.get("limits"),
+    )
+
+
+def _run_operator_telemetry(activity_json: Any, worker_pid: Any, *, active_run: bool) -> Optional[dict]:
+    """Derive an additive operator state from bounded facts, never elapsed time."""
+    if not _run_activity_telemetry_enabled():
+        return None
+    activity = _redacted_run_activity(activity_json)
+    if activity is None:
+        return {"activity": None, "operator_state": "UNKNOWN"}
+    if activity["waiting_for"] in {"approval", "input"}:
+        return {"activity": activity, "operator_state": "WAITING_HUMAN"}
+    liveness = _pid_liveness(worker_pid)
+    if liveness is False:
+        return {"activity": activity, "operator_state": "PROCESS_GONE"}
+    if liveness is not True or not active_run:
+        return {"activity": activity, "operator_state": "UNKNOWN"}
+    if activity["runtime"] == "codex_app_server" and activity["thread_status"] != "active":
+        return {"activity": activity, "operator_state": "UNKNOWN"}
+    if activity["error"] is not None:
+        return {"activity": activity, "operator_state": "UNKNOWN"}
+    return {"activity": activity, "operator_state": "ACTIVE"}
+
+
 @router.get("/workers/active")
 def list_active_workers(board: Optional[str] = _BOARD_Q):
     """Every running worker: an open ``task_runs`` row with a ``worker_pid`` whose
@@ -873,11 +925,17 @@ def list_active_workers(board: Optional[str] = _BOARD_Q):
         rows = conn.execute(
             "SELECT r.id AS run_id, r.task_id, t.title AS task_title, t.status AS task_status, "
             "t.assignee AS task_assignee, r.profile, r.worker_pid, r.started_at, r.claim_lock, "
-            "r.claim_expires, r.last_heartbeat_at, r.max_runtime_seconds "
+            "r.claim_expires, r.last_heartbeat_at, r.max_runtime_seconds, r.activity_json "
             "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
             "WHERE r.ended_at IS NULL AND r.worker_pid IS NOT NULL AND t.status = 'running' "
             "ORDER BY r.started_at ASC").fetchall()
-        workers = [dict(row) for row in rows]
+        workers = []
+        for row in rows:
+            worker = dict(row)
+            telemetry = _run_operator_telemetry(row["activity_json"], row["worker_pid"], active_run=True)
+            if telemetry is not None:
+                worker.update(telemetry)
+            workers.append(worker)
         return {"workers": workers, "count": len(workers), "checked_at": int(time.time())}
 
 
@@ -885,7 +943,14 @@ def list_active_workers(board: Optional[str] = _BOARD_Q):
 def get_run_endpoint(run_id: int, board: Optional[str] = _BOARD_Q):
     """``{run: {...}}`` with the same serialisation as ``GET /tasks/{id}``; 404 if unknown."""
     with _board_conn(board) as (board, conn):
-        return {"run": asdict(_require_run(conn, run_id))}
+        run = _require_run(conn, run_id)
+        payload = asdict(run)
+        telemetry = _run_operator_telemetry(
+            run.activity_json, run.worker_pid, active_run=run.ended_at is None and run.status == "running",
+        )
+        if telemetry is not None:
+            payload.update(telemetry)
+        return {"run": payload}
 
 
 @router.get("/runs/{run_id}/inspect")
@@ -895,8 +960,12 @@ def inspect_run_endpoint(run_id: int, board: Optional[str] = _BOARD_Q):
     with _board_conn(board) as (board, conn):
         r = _require_run(conn, run_id)
 
+    telemetry = _run_operator_telemetry(
+        r.activity_json, r.worker_pid, active_run=r.ended_at is None and r.status == "running",
+    ) or {}
+
     def _dead(reason: str, **extra) -> dict:
-        return {"run_id": run_id, "alive": False, **extra, "reason": reason}
+        return {"run_id": run_id, "alive": False, **extra, "reason": reason, **telemetry}
 
     if r.ended_at is not None:
         return _dead("run already ended")
@@ -919,11 +988,11 @@ def inspect_run_endpoint(run_id: int, board: Optional[str] = _BOARD_Q):
             "memory_rss_bytes": mem.rss if mem else None,
             "memory_vms_bytes": mem.vms if mem else None,
             "num_threads": info.get("num_threads"), "num_fds": num_fds,
-            "status": info.get("status"), "create_time": info.get("create_time"), "cmdline": info.get("cmdline")}
+            "status": info.get("status"), "create_time": info.get("create_time"), "cmdline": info.get("cmdline"), **telemetry}
     except _psutil.NoSuchProcess:
         return _dead("process not found", pid=pid)
     except _psutil.AccessDenied:
-        return {"run_id": run_id, "alive": True, "pid": pid, "error": "access denied"}
+        return {"run_id": run_id, "alive": True, "pid": pid, "error": "access denied", **telemetry}
 
 
 class TerminateRunBody(BaseModel):

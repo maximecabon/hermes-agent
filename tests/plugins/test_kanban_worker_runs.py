@@ -10,6 +10,7 @@ Covers:
 from __future__ import annotations
 
 import importlib.util
+import json
 import secrets
 import sys
 import time
@@ -21,6 +22,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+from agent.session_activity import normalize_agent_activity_snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +103,114 @@ def test_get_run_404_unknown_id(client):
     r = client.get("/api/plugins/kanban/runs/999999")
     assert r.status_code == 404
     assert "999999" in r.json()["detail"]
+
+
+def _activity(*, waiting_for=None, thread_status="active", error=None):
+    return normalize_agent_activity_snapshot(
+        runtime="codex_app_server",
+        waiting_for=waiting_for,
+        thread_status=thread_status,
+        error=error,
+    )
+
+
+def _enable_activity_api(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"kanban": {"persist_run_activity": True}},
+    )
+    module = sys.modules["hermes_dashboard_plugin_kanban_worker_runs_test"]
+    monkeypatch.setattr(module, "_pid_liveness", lambda *_args, **_kwargs: True, raising=False)
+    return module
+
+
+@pytest.mark.parametrize("waiting_for", ["approval", "input"])
+def test_get_run_exposes_each_human_wait_flag_as_waiting_human(client, monkeypatch, waiting_for):
+    _enable_activity_api(monkeypatch)
+    with kb.connect() as conn:
+        _, run_id = _setup_running_task_with_run(conn, title="activity", assignee="worker", worker_pid=12345)
+        snapshot = _activity(waiting_for=waiting_for)
+        conn.execute("UPDATE task_runs SET activity_json = ? WHERE id = ?", (json.dumps(snapshot), run_id))
+        conn.commit()
+
+    body = client.get(f"/api/plugins/kanban/runs/{run_id}").json()["run"]
+    assert body["activity"] == snapshot
+    assert body["operator_state"] == "WAITING_HUMAN"
+
+
+@pytest.mark.parametrize("thread_status", ["idle", "notLoaded", "systemError"])
+def test_get_run_never_infers_process_gone_from_non_active_codex_status(client, monkeypatch, thread_status):
+    _enable_activity_api(monkeypatch)
+    with kb.connect() as conn:
+        _, run_id = _setup_running_task_with_run(conn, title="activity", assignee="worker", worker_pid=12345)
+        conn.execute(
+            "UPDATE task_runs SET activity_json = ? WHERE id = ?",
+            (json.dumps(_activity(thread_status=thread_status)), run_id),
+        )
+        conn.commit()
+
+    assert client.get(f"/api/plugins/kanban/runs/{run_id}").json()["run"]["operator_state"] == "UNKNOWN"
+
+
+def test_get_run_reports_process_gone_only_for_conclusive_dead_pid(client, monkeypatch):
+    module = _enable_activity_api(monkeypatch)
+    monkeypatch.setattr(module, "_pid_liveness", lambda *_args, **_kwargs: False)
+    with kb.connect() as conn:
+        _, run_id = _setup_running_task_with_run(conn, title="activity", assignee="worker", worker_pid=12345)
+        conn.execute("UPDATE task_runs SET activity_json = ? WHERE id = ?", (json.dumps(_activity()), run_id))
+        conn.commit()
+
+    assert client.get(f"/api/plugins/kanban/runs/{run_id}").json()["run"]["operator_state"] == "PROCESS_GONE"
+
+
+def test_get_run_reports_unknown_when_pid_liveness_is_unavailable(client, monkeypatch):
+    module = _enable_activity_api(monkeypatch)
+    monkeypatch.setattr(module, "_pid_liveness", lambda *_args, **_kwargs: None)
+    with kb.connect() as conn:
+        _, run_id = _setup_running_task_with_run(conn, title="activity", assignee="worker", worker_pid=12345)
+        conn.execute("UPDATE task_runs SET activity_json = ? WHERE id = ?", (json.dumps(_activity()), run_id))
+        conn.commit()
+
+    assert client.get(f"/api/plugins/kanban/runs/{run_id}").json()["run"]["operator_state"] == "UNKNOWN"
+
+
+def test_get_run_reports_unknown_when_no_pid_was_recorded(client, monkeypatch):
+    module = _enable_activity_api(monkeypatch)
+    monkeypatch.setattr(module, "_pid_liveness", lambda *_args, **_kwargs: None)
+    with kb.connect() as conn:
+        _, run_id = _setup_running_task_with_run(conn, title="activity", assignee="worker", worker_pid=None)
+        conn.execute("UPDATE task_runs SET activity_json = ? WHERE id = ?", (json.dumps(_activity()), run_id))
+        conn.commit()
+
+    assert client.get(f"/api/plugins/kanban/runs/{run_id}").json()["run"]["operator_state"] == "UNKNOWN"
+
+
+def test_workers_active_exposes_only_redacted_activity_and_derived_state(client, monkeypatch):
+    _enable_activity_api(monkeypatch)
+    with kb.connect() as conn:
+        _, run_id = _setup_running_task_with_run(conn, title="activity", assignee="worker", worker_pid=12345)
+        snapshot = _activity(waiting_for="approval")
+        snapshot["ignored_payload"] = "Bearer secret-that-must-not-leak"
+        conn.execute("UPDATE task_runs SET activity_json = ? WHERE id = ?", (json.dumps(snapshot), run_id))
+        conn.commit()
+
+    worker = client.get("/api/plugins/kanban/workers/active").json()["workers"][0]
+    assert worker["run_id"] == run_id
+    assert worker["operator_state"] == "WAITING_HUMAN"
+    assert worker["activity"]["waiting_for"] == "approval"
+    assert "ignored_payload" not in worker["activity"]
+    assert "secret-that-must-not-leak" not in repr(worker["activity"])
+
+
+def test_get_run_hides_derived_telemetry_when_the_opt_in_flag_is_off(client):
+    with kb.connect() as conn:
+        _, run_id = _setup_running_task_with_run(conn, title="activity", assignee="worker", worker_pid=12345)
+        conn.execute("UPDATE task_runs SET activity_json = ? WHERE id = ?", (json.dumps(_activity()), run_id))
+        conn.commit()
+
+    body = client.get(f"/api/plugins/kanban/runs/{run_id}").json()["run"]
+    assert "activity" not in body
+    assert "operator_state" not in body
 
 
 # ---------------------------------------------------------------------------

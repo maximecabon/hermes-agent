@@ -357,6 +357,11 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     }
 
     def on_event(note: dict) -> None:
+        from agent.transports.codex_app_server_session import codex_thread_status_activity
+
+        status_activity = codex_thread_status_activity(note)
+        if status_activity is not None:
+            agent._codex_thread_status, agent._activity_waiting_for = status_activity
         handler = handlers.get(note.get("method") or "") if isinstance(note, dict) else None
         if handler is not None:
             params = note.get("params")
@@ -378,6 +383,7 @@ def build_codex_app_server_activity_snapshot(agent, *, turn=None) -> dict:
             getattr(agent, "_activity_waiting_for", None)
             or infer_activity_waiting_for(getattr(agent, "_last_activity_desc", None))
         ),
+        thread_status=getattr(agent, "_codex_thread_status", None),
         error=getattr(turn, "error", None) if turn is not None else getattr(agent, "_last_activity_error", None),
         tokens={
             "input": usage.get("inputTokens", getattr(agent, "session_input_tokens", 0)),

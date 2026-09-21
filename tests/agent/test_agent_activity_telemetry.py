@@ -31,6 +31,7 @@ def test_normalizer_emits_bounded_redacted_contract():
         "runtime": "hermes",
         "tool": "other",
         "waiting_for": "provider",
+        "thread_status": None,
         "error": "runtime_error",
         "tokens": {"input": 0, "output": AGENT_ACTIVITY_COUNT_MAX, "total": 7},
         "limits": {"iterations_used": 3, "iterations_max": None, "context_window": 200000},
@@ -59,6 +60,7 @@ def test_standard_adapter_reads_existing_activity_without_payloads():
         "runtime": "hermes",
         "tool": "terminal",
         "waiting_for": "provider",
+        "thread_status": None,
         "error": None,
         "tokens": {"input": 11, "output": 7, "total": 18},
         "limits": {"iterations_used": 2, "iterations_max": 5, "context_window": 128000},
@@ -72,6 +74,21 @@ def test_normalizer_hides_unbounded_iteration_limit():
     )
 
     assert snapshot["limits"]["iterations_max"] is None
+
+
+@pytest.mark.parametrize(
+    ("waiting_for", "expected"),
+    [("approval", "approval"), ("input", "input")],
+)
+def test_normalizer_keeps_only_closed_human_wait_and_codex_status(waiting_for, expected):
+    snapshot = normalize_agent_activity_snapshot(
+        runtime="codex_app_server",
+        waiting_for=waiting_for,
+        thread_status="active",
+    )
+
+    assert snapshot["waiting_for"] == expected
+    assert snapshot["thread_status"] == "active"
 
 
 def test_standard_adapter_classifies_existing_tool_error_label():
@@ -112,6 +129,7 @@ def test_codex_adapter_uses_the_same_contract_and_token_usage():
         "runtime": "codex_app_server",
         "tool": None,
         "waiting_for": "codex",
+        "thread_status": None,
         "error": "oauth_error",
         "tokens": {"input": 80, "output": 25, "total": 130},
         "limits": {"iterations_used": 1, "iterations_max": 4, "context_window": 200000},

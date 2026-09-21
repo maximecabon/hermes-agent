@@ -98,6 +98,26 @@ def _notification_belongs_to_turn(note: dict, *, thread_id: Optional[str], turn_
     )
 
 
+def codex_thread_status_activity(note: dict) -> tuple[str, str | None] | None:
+    """Project the two official Codex human-wait flags into bounded activity facts."""
+    if not isinstance(note, dict) or note.get("method") != "thread/status/changed":
+        return None
+    params = note.get("params") or {}
+    status = params.get("status") if isinstance(params, dict) else None
+    if not isinstance(status, dict):
+        return None
+    status_type = status.get("type")
+    if status_type not in {"active", "idle", "notLoaded", "systemError"}:
+        return None
+    flags = status.get("activeFlags") if status_type == "active" else []
+    flags = flags if isinstance(flags, list) else []
+    if "waitingOnApproval" in flags:
+        return status_type, "approval"
+    if "waitingOnUserInput" in flags:
+        return status_type, "input"
+    return status_type, None
+
+
 def _coerce_turn_input_text(user_input: Any) -> str:
     """Collapse rich content parts into app-server text (``turn/start`` is text-only; images become a marker)."""
     if isinstance(user_input, str):

@@ -21,6 +21,19 @@ import run_agent
 from agent.transports.codex_app_server_session import CodexAppServerSession, TurnResult
 
 
+@pytest.mark.parametrize(
+    ("active_flags", "expected_waiting_for"),
+    [(["waitingOnApproval"], "approval"), (["waitingOnUserInput"], "input")],
+)
+def test_codex_thread_status_transport_maps_each_official_human_wait_flag(active_flags, expected_waiting_for):
+    from agent.transports.codex_app_server_session import codex_thread_status_activity
+
+    assert codex_thread_status_activity({
+        "method": "thread/status/changed",
+        "params": {"threadId": "thread-1", "status": {"type": "active", "activeFlags": active_flags}},
+    }) == ("active", expected_waiting_for)
+
+
 @pytest.fixture
 def fake_session(monkeypatch):
     """Replace CodexAppServerSession with a stub that returns a fixed

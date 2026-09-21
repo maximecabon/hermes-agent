@@ -21,7 +21,8 @@ _AGENT_ACTIVITY_TOOL_ALLOWLIST = frozenset({
     "terminal", "read_file", "write_file", "patch", "web_search", "web_extract",
     "browser", "execute_code", "exec_command", "apply_patch", "delegate_task",
 })
-_AGENT_ACTIVITY_WAITING_FOR_ALLOWLIST = frozenset({"provider", "tool", "approval", "codex"})
+_AGENT_ACTIVITY_WAITING_FOR_ALLOWLIST = frozenset({"provider", "tool", "approval", "input", "codex"})
+_AGENT_ACTIVITY_THREAD_STATUS_ALLOWLIST = frozenset({"active", "idle", "notLoaded", "systemError"})
 
 
 class AgentActivityTokens(TypedDict):
@@ -41,6 +42,7 @@ class AgentActivitySnapshotV1(TypedDict):
     runtime: str
     tool: str | None
     waiting_for: str | None
+    thread_status: str | None
     error: str | None
     tokens: AgentActivityTokens
     limits: AgentActivityLimits
@@ -100,6 +102,12 @@ def _safe_activity_waiting_for(value: Any) -> str | None:
     return str(value) if str(value) in _AGENT_ACTIVITY_WAITING_FOR_ALLOWLIST else None
 
 
+def _safe_activity_thread_status(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value) if str(value) in _AGENT_ACTIVITY_THREAD_STATUS_ALLOWLIST else None
+
+
 def activity_error_kind(error: Any) -> str | None:
     """Classify an error without returning its text, payload, or exception args."""
     if error is None or error == "":
@@ -137,7 +145,7 @@ def activity_waiting_for(agent: Any, waiting_for: str):
 
 
 def normalize_agent_activity_snapshot(
-    *, runtime: Any, tool: Any = None, waiting_for: Any = None, error: Any = None,
+    *, runtime: Any, tool: Any = None, waiting_for: Any = None, thread_status: Any = None, error: Any = None,
     tokens: Mapping[str, Any] | None = None, limits: Mapping[str, Any] | None = None,
     **_ignored_payload: Any,
 ) -> AgentActivitySnapshotV1:
@@ -156,6 +164,7 @@ def normalize_agent_activity_snapshot(
         "runtime": "codex_app_server" if runtime == "codex_app_server" else "hermes",
         "tool": _safe_activity_tool(tool),
         "waiting_for": _safe_activity_waiting_for(waiting_for),
+        "thread_status": _safe_activity_thread_status(thread_status),
         "error": activity_error_kind(error),
         "tokens": {
             "input": _bounded_activity_count(token_values.get("input")) or 0,
