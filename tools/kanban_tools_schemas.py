@@ -548,6 +548,25 @@ KANBAN_RESUME_HUMAN_ANSWER_SCHEMA = _schema(
     ["task_id", "answer"],
 )
 
+KANBAN_NEEDS_REPLAN_SCHEMA = _schema(
+    "kanban_needs_replan",
+    (
+        "Atomically close the current worker run, persist its findings, and "
+        "route the repair round to one Planner parent. Replays for the same "
+        "task and repair round return that existing parent without opening a "
+        "second Planner task."
+    ),
+    {
+        "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "findings": {
+            "type": "array",
+            "items": _prop("string", "Stable finding identifier or concise finding."),
+            "description": "Non-empty findings to persist for the Planner replan context.",
+        },
+    },
+    ["findings"],
+)
+
 KANBAN_LINK_SCHEMA = _schema(
     "kanban_link",
     (

@@ -1960,6 +1960,106 @@ def resume_human_answer(conn: sqlite3.Connection, task_id: str, answer: Any) -> 
     return True
 
 
+def needs_replan(
+    conn: sqlite3.Connection, task_id: str, *, findings: Iterable[str],
+    expected_run_id: Optional[int] = None,
+) -> Optional[str]:
+    """Atomically hand one running repair round to exactly one Planner task.
+
+    The replan key is scoped to ``task_id`` and the durable repair round.  A
+    replay returns the existing Planner parent without closing the source run
+    again.  All first-time mutations stay in one ``BEGIN IMMEDIATE``
+    transaction, so an exception leaves neither a Planner orphan nor a source
+    task that can be admitted before its parent exists.
+    """
+    normalized_findings = [str(finding).strip() for finding in findings if str(finding).strip()]
+    if not normalized_findings:
+        raise ValueError("findings must contain at least one non-blank finding")
+
+    with write_txn(conn):
+        source = conn.execute(
+            """
+            SELECT id, status, current_run_id, repair_depth, repair_round,
+                   root_task_id, tenant
+              FROM tasks
+             WHERE id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        if source is None:
+            return None
+        repair_round = int(source["repair_round"] or 0)
+        replan_key = f"replan:{task_id}:{repair_round}"
+        existing = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (replan_key,),
+        ).fetchone()
+        if existing is not None:
+            return str(existing["id"])
+        if source["status"] != "running":
+            return None
+        active_run_id = _opt_int(source["current_run_id"])
+        if active_run_id is None or (
+            expected_run_id is not None and active_run_id != int(expected_run_id)
+        ):
+            return None
+
+        root_task_id = _row_get(source, "root_task_id") or task_id
+        planner_body = json.dumps({
+            "schema_version": "kanban.needs_replan.v1",
+            "source_task_id": task_id,
+            "root_task_id": root_task_id,
+            "repair_round": repair_round,
+            "findings": normalized_findings,
+        }, ensure_ascii=False, sort_keys=True)
+        parent_id = create_task(
+            conn,
+            title=f"Replan {task_id} round {repair_round}",
+            body=planner_body,
+            assignee="planner",
+            created_by="needs_replan",
+            tenant=_row_get(source, "tenant"),
+            idempotency_key=replan_key,
+            creator_task_id=task_id,
+            repair_depth=int(source["repair_depth"] or 0),
+            repair_round=repair_round,
+            repair_stage="PLANNING_ESCALATION",
+            root_task_id=root_task_id,
+        )
+        _link(conn, parent_id, task_id)
+        changed = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'todo', claim_lock = NULL, claim_expires = NULL,
+                   worker_pid = NULL, repair_stage = 'PLANNING_ESCALATION'
+             WHERE id = ? AND status = 'running' AND current_run_id = ?
+            """,
+            (task_id, active_run_id),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError("needs_replan source state changed during transition")
+        closed_run_id = _end_run(
+            conn, task_id, outcome="needs_replan", status="done",
+            summary="Escalated to Planner for replan.",
+            metadata={"parent_id": parent_id, "replan_key": replan_key},
+        )
+        if closed_run_id is None:
+            raise RuntimeError("needs_replan source run disappeared during transition")
+        _append_event(
+            conn, task_id, "needs_replan",
+            {
+                "findings": normalized_findings,
+                "parent_id": parent_id,
+                "replan_key": replan_key,
+                "repair_round": repair_round,
+                "root_task_id": root_task_id,
+            },
+            run_id=closed_run_id,
+        )
+        return parent_id
+
+
 def _persist_human_question(
     conn: sqlite3.Connection, task_id: str, root_task_id: str, question: dict,
 ) -> dict:

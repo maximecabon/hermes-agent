@@ -24,7 +24,8 @@ from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
-    KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA, KANBAN_RESUME_HUMAN_ANSWER_SCHEMA)
+    KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA, KANBAN_RESUME_HUMAN_ANSWER_SCHEMA,
+    KANBAN_NEEDS_REPLAN_SCHEMA)
 
 logger = logging.getLogger(__name__)
 
@@ -1016,6 +1017,24 @@ def _handle_resume_human_answer(args: dict, **kw) -> str:
         return _ok(task_id=tid, status=task.status, resumed=resumed)
 
 
+@_kanban_handler("kanban_needs_replan")
+def _handle_needs_replan(args: dict, **kw) -> str:
+    """Close the worker-owned repair run and hand its findings to Planner."""
+    tid = _worker_guard("kanban_needs_replan", args)
+    raw_findings = args.get("findings")
+    _check(isinstance(raw_findings, (list, tuple)), "findings must be a list of strings")
+    findings = [_redact(item).strip() for item in raw_findings if str(item).strip()]
+    _check(findings, "findings must contain at least one non-blank finding")
+    with _board(args.get("board")) as (kb, conn):
+        parent_id = kb.needs_replan(
+            conn, tid, findings=findings, expected_run_id=_worker_run_id(tid),
+        )
+        task = kb.get_task(conn, tid)
+        _check(parent_id is not None and task is not None,
+               f"could not route {tid} to Planner (unknown id, stale run, or invalid state)")
+        return _ok(task_id=tid, parent_id=parent_id, status=task.status)
+
+
 @_kanban_handler("kanban_link")
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact (cycles/self-links → ValueError)."""
@@ -1047,6 +1066,7 @@ _TOOLS = (
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
     ("kanban_resume_human_answer", KANBAN_RESUME_HUMAN_ANSWER_SCHEMA, _handle_resume_human_answer, "▶"),
+    ("kanban_needs_replan", KANBAN_NEEDS_REPLAN_SCHEMA, _handle_needs_replan, "↪"),
     ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:
