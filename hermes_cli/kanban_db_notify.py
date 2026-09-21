@@ -31,9 +31,147 @@ _SCALAR_TYPES = (str, int, float, bool)
 # ``(task_id, platform, chat_id, thread_id or "")`` against it.
 _SUB_KEY_WHERE = "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?"
 
+# The origin leg is deliberately narrower than generic notification delivery:
+# a correlated typed ``needs_input`` question must not keep re-posting into a
+# human conversation forever.  Its retry ledger lives in ``task_events`` so it
+# survives gateway restarts without a subscription-schema migration.  Attempt
+# one is immediate; failures retry after 1s then 5s, and the third failure is
+# durably terminal for that exact task/subscription/event correlation.
+ORIGIN_WAKE_MAX_ATTEMPTS = 3
+_ORIGIN_WAKE_RETRY_DELAYS = (1, 5)
+_ORIGIN_WAKE_EVENT_KINDS = ("origin_wake_retry", "origin_exhausted")
+
 
 def _sub_key(task_id: str, platform: str, chat_id: str, thread_id: Optional[str]) -> tuple:
     return (task_id, platform, chat_id, thread_id or "")
+
+
+def _is_correlated_needs_input_event(event: Event) -> bool:
+    payload = event.payload or {}
+    question = payload.get("human_question")
+    return (
+        event.kind == "blocked"
+        and payload.get("kind") == "needs_input"
+        and isinstance(question, dict)
+        and bool(question.get("question_id"))
+    )
+
+
+def _origin_payload_matches(payload: Any, key: tuple, event_id: int) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    return (
+        int(payload.get("origin_event_id") or 0) == int(event_id)
+        and tuple(payload.get("subscription") or ()) == key
+    )
+
+
+def origin_wake_state(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    event_id: int,
+) -> dict[str, Any]:
+    """Durable retry/exhaustion state for one correlated origin wake.
+
+    The event id and full subscription key prevent one origin chat from
+    consuming another chat's retry budget for the same Kanban task.
+    """
+    key = _sub_key(task_id, platform, chat_id, thread_id)
+    rows = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? "
+        "AND kind IN (?, ?) ORDER BY id ASC",
+        (task_id, *_ORIGIN_WAKE_EVENT_KINDS),
+    ).fetchall()
+    state = {"attempts": 0, "retry_at": 0, "exhausted": False}
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "null")
+        except (TypeError, ValueError):
+            continue
+        if not _origin_payload_matches(payload, key, event_id):
+            continue
+        state = {
+            "attempts": int(payload.get("attempts") or 0),
+            "retry_at": int(payload.get("retry_at") or 0),
+            "exhausted": row["kind"] == "origin_exhausted",
+        }
+    return state
+
+
+def origin_wake_retry_due(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    now: Optional[int] = None,
+) -> bool:
+    """Whether the oldest unseen correlated question may be claimed now."""
+    cursor = _notify_cursor(conn, task_id, platform, chat_id, thread_id)
+    if cursor is None:
+        return False
+    rows = conn.execute(
+        "SELECT * FROM task_events WHERE task_id = ? AND id > ? AND kind = 'blocked' ORDER BY id ASC",
+        (task_id, cursor),
+    ).fetchall()
+    for row in rows:
+        event = _kb.Event.from_row(row)
+        if not _is_correlated_needs_input_event(event):
+            continue
+        state = origin_wake_state(
+            conn, task_id=task_id, platform=platform, chat_id=chat_id,
+            thread_id=thread_id, event_id=event.id,
+        )
+        if state["exhausted"]:
+            return False
+        return int(state["retry_at"] or 0) <= int(time.time() if now is None else now)
+    return True
+
+
+def settle_origin_wake_failure(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    event_id: int,
+    claimed_cursor: int,
+    old_cursor: int,
+    now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Record one failed correlated wake and atomically rewind or exhaust it.
+
+    Rewinding in the same transaction as the ledger append means a gateway
+    crash cannot leave a retry scheduled behind an advanced cursor.  The third
+    failed attempt intentionally keeps the claimed cursor, producing the
+    durable ``origin_exhausted`` acknowledgement and preventing a fourth send.
+    """
+    key = _sub_key(task_id, platform, chat_id, thread_id)
+    at = int(time.time() if now is None else now)
+    with _kb.write_txn(conn):
+        state = origin_wake_state(
+            conn, task_id=task_id, platform=platform, chat_id=chat_id,
+            thread_id=thread_id, event_id=event_id,
+        )
+        attempts = int(state["attempts"]) + 1
+        exhausted = attempts >= ORIGIN_WAKE_MAX_ATTEMPTS
+        retry_at = 0 if exhausted else at + _ORIGIN_WAKE_RETRY_DELAYS[attempts - 1]
+        payload = {
+            "origin_event_id": int(event_id),
+            "subscription": list(key),
+            "attempts": attempts,
+            "retry_at": retry_at,
+        }
+        _kb._append_event(conn, task_id, "origin_exhausted" if exhausted else "origin_wake_retry", payload)
+        if not exhausted:
+            _cas_cursor(conn, key, int(old_cursor), int(claimed_cursor))
+    return {"attempts": attempts, "retry_at": retry_at, "exhausted": exhausted}
 
 
 def _encode_notify_delivery_metadata(metadata: Optional[Mapping[str, Any]]) -> Optional[str]:

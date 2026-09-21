@@ -251,6 +251,11 @@ class _Collector:
         if _adapter_for_subscription(self.runner, Platform(platform), sub, owner_profile or self.notifier_profile) is None:
             _warn_anchorless_thread_sub_once(sub, platform)
             return None
+        if not _kbn().origin_wake_retry_due(
+            conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
+            thread_id=sub.get("thread_id") or "",
+        ):
+            return None
         old_cursor, cursor, events = _kbn().claim_unseen_events_for_sub(
             conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
             thread_id=sub.get("thread_id") or "", kinds=TERMINAL_KINDS,
@@ -258,9 +263,25 @@ class _Collector:
         if not events:
             return None
         task = self.kb.get_task(conn, sub["task_id"])
+        human_questions: dict[int, dict] = {}
+        for event in events:
+            payload = event.payload or {}
+            question_ref = payload.get("human_question")
+            if event.kind != "blocked" or payload.get("kind") != "needs_input" or not isinstance(question_ref, dict):
+                continue
+            question_id = question_ref.get("question_id")
+            if not question_id:
+                continue
+            stored = self.kb.get_human_question(conn, sub["task_id"], str(question_id))
+            question = stored.get("question") if isinstance(stored, dict) else None
+            if isinstance(question, dict):
+                human_questions[event.id] = question
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
-                     len(events), sub["task_id"], slug, old_cursor, cursor)
-        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
+                    len(events), sub["task_id"], slug, old_cursor, cursor)
+        return {
+            "sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events,
+            "task": task, "board": slug, "human_questions": human_questions,
+        }
 
     def collect_board(self, slug: str) -> None:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
@@ -341,6 +362,21 @@ def _fmt_completed(ev, n) -> tuple:
     return f"✔ {n.head} done — {n.title}{handoff}", wake_handoff, None
 
 
+def _fmt_blocked(ev, n) -> tuple:
+    """Render a typed Human Wait with its persisted, complete prompt."""
+    msg = f"⏸ {n.head} blocked{_clip(ev, 'reason', ': {}', 160)}"
+    question = n.human_questions.get(ev.id)
+    if not question:
+        return msg, None, None
+    prompt = str(question.get("prompt") or "").strip()
+    choices = question.get("choices") or []
+    if prompt:
+        msg += f"\nHuman input required: {prompt}"
+    if choices:
+        msg += "\nChoices: " + " | ".join(str(choice) for choice in choices)
+    return msg, None, None
+
+
 def _fmt_review_requested(ev, n) -> tuple:
     # Implementation done; task moved to the review lane. Carry the handoff
     # into the wake turn like ``completed`` so the reviewer needn't re-read the board.
@@ -412,7 +448,7 @@ def _fmt_timed_out(ev, n) -> tuple:
 # never wake the creator.
 _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     "completed": _fmt_completed,
-    "blocked": lambda ev, n: (f"⏸ {n.head} blocked{_clip(ev, 'reason', ': {}', 160)}", None, None),
+    "blocked": _fmt_blocked,
     "gave_up": _fmt_gave_up,
     "crashed": lambda ev, n: (
         f"✖ {n.head} — its worker stopped unexpectedly; it will be retried automatically.", None, None,
@@ -443,6 +479,7 @@ class _KanbanNotification:
         self.sub_fail_counts = sub_fail_counts
         self.sub = sub = d["sub"]
         self.task = task = d["task"]
+        self.human_questions: dict[int, dict] = d.get("human_questions") or {}
         self.board_slug = d.get("board")
         self.platform_str = (sub["platform"] or "").lower()
         self.task_id = sub["task_id"]
@@ -464,6 +501,7 @@ class _KanbanNotification:
         self.adapter: Any = None
         self.is_push_adapter = True
         self.wake_kinds: set = set()
+        self.origin_event_id: Optional[int] = None
 
     # -- cursor / subscription ops (blocking, run in a fresh-context thread) --
 
@@ -497,6 +535,24 @@ class _KanbanNotification:
         drop_fmt = "kanban notifier: dropping subscription %s on %s after %d consecutive wake failures"
         await self.delivery_failed(fmt, (self.task_id,), drop_fmt, exc, True)
 
+    async def _settle_origin_wake_failure(self) -> dict:
+        """Persist/retry one typed origin wake without an in-memory counter."""
+        assert self.origin_event_id is not None
+
+        def settle() -> dict:
+            conn = _kbc().connect(board=self.board_slug)
+            try:
+                return _kbn().settle_origin_wake_failure(
+                    conn, task_id=self.sub["task_id"], platform=self.sub["platform"],
+                    chat_id=self.sub["chat_id"], thread_id=self.sub.get("thread_id") or "",
+                    event_id=self.origin_event_id, claimed_cursor=self.d["cursor"],
+                    old_cursor=self.d.get("old_cursor", 0),
+                )
+            finally:
+                conn.close()
+
+        return await _to_thread_process_service(settle)
+
     # -- formatting --
 
     def format_event(self, ev: Any) -> Optional[str]:
@@ -515,6 +571,12 @@ class _KanbanNotification:
         """Set ``wake_kinds`` / ``session_key`` / ``synth`` for the wake paths."""
         task, sub = self.task, self.sub
         self.wake_kinds = {ev.kind for ev in self.d["events"] if ev.kind in _WAKE_KINDS} if self.wake_agent else set()
+        self.origin_event_id = next((
+            ev.id for ev in self.d["events"]
+            if ev.kind == "blocked"
+            and (ev.payload or {}).get("kind") == "needs_input"
+            and ev.id in self.human_questions
+        ), None)
         if not self.wake_kinds:
             return
         if self.is_push_adapter:
@@ -538,6 +600,14 @@ class _KanbanNotification:
             synth += "\n" + t("gateway.kanban.wake.handoff", summary=self.wake_handoff)
         if self.wake_review_detail:
             synth += "\n" + t("gateway.kanban.wake.review_detail", reason=self.wake_review_detail)
+        if self.origin_event_id is not None:
+            question = self.human_questions.get(self.origin_event_id) or {}
+            prompt = str(question.get("prompt") or "").strip()
+            choices = question.get("choices") or []
+            if prompt:
+                synth += f"\nHuman input required: {prompt}"
+            if choices:
+                synth += "\nChoices: " + " | ".join(str(choice) for choice in choices)
         self.synth = synth + "\n\n" + t("gateway.kanban.wake.guidance")
 
     def _log_woke(self) -> None:
@@ -687,17 +757,33 @@ class _KanbanNotification:
             try:
                 await self.wake()
                 self.clear_failures()
-            except WakeNotAccepted:
+            except WakeNotAccepted as wake_error:
                 # Startup / full queue is not a dead destination. Keep the durable
                 # subscription alive regardless of how long admission takes.
-                await self.rewind()
+                if self.origin_event_id is not None:
+                    state = await self._settle_origin_wake_failure()
+                    logger.warning(
+                        "kanban notifier: origin wake for %s not accepted (attempt %d/%d, exhausted=%s): %s",
+                        self.task_id, state["attempts"], _kbn().ORIGIN_WAKE_MAX_ATTEMPTS,
+                        state["exhausted"], wake_error,
+                    )
+                else:
+                    await self.rewind()
                 return
             except Exception as _wk_err:
-                await self._wake_failed(
-                    "kanban notifier: wake-only delivery failed for %s (attempt %d/%d): %s" if is_push
-                    else "kanban notifier: wake self-post failed for %s (attempt %d/%d): %s",
-                    _wk_err,
-                )
+                if self.origin_event_id is not None:
+                    state = await self._settle_origin_wake_failure()
+                    logger.warning(
+                        "kanban notifier: origin wake failed for %s (attempt %d/%d, exhausted=%s): %s",
+                        self.task_id, state["attempts"], _kbn().ORIGIN_WAKE_MAX_ATTEMPTS,
+                        state["exhausted"], _wk_err,
+                    )
+                else:
+                    await self._wake_failed(
+                        "kanban notifier: wake-only delivery failed for %s (attempt %d/%d): %s" if is_push
+                        else "kanban notifier: wake self-post failed for %s (attempt %d/%d): %s",
+                        _wk_err,
+                    )
                 return
 
         # Delivery complete: advance the cursor (the dedup mechanism).
