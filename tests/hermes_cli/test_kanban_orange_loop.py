@@ -261,3 +261,70 @@ def test_needs_replan_tool_closes_the_current_worker_run(
     assert result["status"] == "todo"
     with kbc.connect() as conn:
         assert kb.parent_ids(conn, source_id) == [result["parent_id"]]
+
+
+def test_only_the_expected_planner_run_can_create_or_link_orange_subcards(tmp_path: Path) -> None:
+    with kbc.connect_closing(tmp_path / "kanban.db") as conn:
+        source_id, source_run_id = _claimed_replan_source(conn)
+        planner_id = kb.needs_replan(
+            conn, source_id, findings=["TECH-001"], expected_run_id=source_run_id,
+        )
+        planner = kb.claim_task(conn, planner_id, claimer="planner:test")
+        specialist_id = kb.create_task(conn, title="Specialist", assignee="builder")
+        specialist = kb.claim_task(conn, specialist_id, claimer="builder:test")
+
+        assert planner is not None
+        assert planner.current_run_id is not None
+        assert specialist is not None
+        assert specialist.current_run_id is not None
+
+        try:
+            kb.create_task(
+                conn, title="Unauthorized orange child", parents=[planner_id],
+                actor_task_id=specialist_id, actor_run_id=specialist.current_run_id,
+            )
+        except PermissionError as exc:
+            assert "expected Planner run" in str(exc)
+        else:
+            raise AssertionError("a specialist run must not create an orange subcard")
+
+        try:
+            kb.create_task(
+                conn, title="Stale Planner child", parents=[planner_id],
+                actor_task_id=planner_id, actor_run_id=planner.current_run_id + 1,
+            )
+        except PermissionError as exc:
+            assert "expected Planner run" in str(exc)
+        else:
+            raise AssertionError("a stale Planner run must not create an orange subcard")
+
+        first_child = kb.create_task(
+            conn, title="Authorized first child", parents=[planner_id],
+            actor_task_id=planner_id, actor_run_id=planner.current_run_id,
+        )
+        second_child = kb.create_task(
+            conn, title="Authorized second child", parents=[planner_id],
+            actor_task_id=planner_id, actor_run_id=planner.current_run_id,
+        )
+        kb.link_tasks(
+            conn, first_child, second_child,
+            actor_task_id=planner_id, actor_run_id=planner.current_run_id,
+        )
+
+        try:
+            kb.link_tasks(
+                conn, first_child, planner_id,
+                actor_task_id=specialist_id, actor_run_id=specialist.current_run_id,
+            )
+        except PermissionError as exc:
+            assert "expected Planner run" in str(exc)
+        else:
+            raise AssertionError("a specialist run must not relink an orange subcard")
+
+        ordinary_parent = kb.create_task(conn, title="ordinary parent")
+        ordinary_child = kb.create_task(conn, title="ordinary child")
+        kb.link_tasks(conn, ordinary_parent, ordinary_child)
+
+        assert kb.get_task(conn, first_child).root_task_id == "t_root"
+        assert set(kb.parent_ids(conn, second_child)) == {first_child, planner_id}
+        assert kb.parent_ids(conn, ordinary_child) == [ordinary_parent]

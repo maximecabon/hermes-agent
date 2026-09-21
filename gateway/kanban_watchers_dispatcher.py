@@ -266,6 +266,12 @@ class _KanbanDispatcher:
                         if attempted >= auto_decompose_per_tick:
                             break
                         attempted += 1
+                        if self._is_orange_replan_task(slug, tid):
+                            logger.debug(
+                                "kanban auto-decompose [%s]: %s is Planner-governed orange work; skipping",
+                                slug, tid,
+                            )
+                            continue
                         successes += self._decompose_one(_decomp, slug, tid)
                 finally:
                     if prev_env is None:
@@ -273,6 +279,23 @@ class _KanbanDispatcher:
                     else:
                         os.environ["HERMES_KANBAN_BOARD"] = prev_env
         return successes
+
+    @staticmethod
+    def _is_orange_replan_task(slug: str, task_id: str) -> bool:
+        """The generic triage decomposer must not author Planner-owned repair work."""
+        conn = None
+        try:
+            from hermes_cli import kanban_db
+
+            conn = _kbc().connect(board=slug)
+            return kanban_db.is_orange_replan_task(conn, task_id)
+        except Exception as exc:
+            logger.debug("kanban auto-decompose: orange lookup failed on %s (%s)", task_id, exc)
+            return False
+        finally:
+            if conn is not None:
+                with contextlib.suppress(Exception):
+                    conn.close()
 
     @staticmethod
     def _decompose_one(_decomp: Any, slug: str, tid: str) -> int:

@@ -85,6 +85,12 @@ class TestGuidanceConstants:
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
 
+    def test_kanban_guidance_reserves_orange_decomposition_for_the_active_planner_run(self):
+        from agent.prompt_builder import KANBAN_GUIDANCE
+
+        assert "active Planner run" in KANBAN_GUIDANCE
+        assert "orange subcards" in KANBAN_GUIDANCE
+
 
 # =========================================================================
 # Context injection scanning

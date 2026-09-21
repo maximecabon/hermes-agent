@@ -47,3 +47,34 @@ def test_auto_decompose_tick_reads_launch_profile_secrets_under_multiplex(monkey
     assert decomposed == 1
     assert seen["value"] == "launch-profile-key"
     assert ss.current_secret_scope() is None
+
+
+def test_auto_decompose_tick_skips_orange_triage_task(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    monkeypatch.setattr(kwd, "_board_slugs", lambda kb: ["default"])
+    kb._INITIALIZED_PATHS.clear()
+    with kbc.connect(board="default") as conn:
+        task_id = kb.create_task(
+            conn, title="orange triage", triage=True,
+            repair_stage="PLANNING_ESCALATION", root_task_id="t_root",
+        )
+        assert kb.is_orange_replan_task(conn, task_id)
+
+    seen = []
+    fake = SimpleNamespace(
+        list_triage_ids=lambda: [task_id],
+        decompose_task=lambda task_id, author=None: seen.append((task_id, author)),
+    )
+    monkeypatch.setitem(sys.modules, "hermes_cli.kanban_decompose", fake)
+    dispatcher = _dispatcher()
+
+    assert dispatcher.auto_decompose_tick(5) == 0
+    assert seen == []

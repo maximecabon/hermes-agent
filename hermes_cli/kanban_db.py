@@ -1262,6 +1262,7 @@ def create_task(
     completion_contract: Optional[str] = None,
     repair_depth: int = 0, repair_round: int = 0, repair_stage: Optional[str] = None,
     root_task_id: Optional[str] = None,
+    actor_task_id: Optional[str] = None, actor_run_id: Optional[int] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1277,6 +1278,8 @@ def create_task(
     in the active profile's projects.db — see ``_resolve_project_link``.
     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
+    An orange replan subcard inherits its repair lineage from a parent and may
+    be created only by that repair round's currently running Planner actor.
     """
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
@@ -1316,17 +1319,6 @@ def create_task(
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
 
-    # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
-    # race may insert twice, the next lookup stabilises on the newest.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
-
     now = int(time.time())
 
     # Only persistent kinds inherit the board ``default_workdir``: a scratch
@@ -1343,6 +1335,22 @@ def create_task(
             # allow_nested: graph builders compose create_task under one outer
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
+                orange_actor = _require_orange_planner_actor(
+                    conn, parents, actor_task_id=actor_task_id, actor_run_id=actor_run_id,
+                )
+                if idempotency_key:
+                    row = conn.execute(
+                        "SELECT id FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' "
+                        "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
+                    ).fetchone()
+                    if row:
+                        return row["id"]
+                if orange_actor is not None:
+                    repair_depth = int(orange_actor["repair_depth"] or 0)
+                    repair_round = int(orange_actor["repair_round"] or 0)
+                    repair_stage = orange_actor["repair_stage"]
+                    root_task_id = orange_actor["root_task_id"]
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
@@ -1433,6 +1441,71 @@ def _link(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
         (parent_id, child_id),
     )
+
+
+_ORANGE_PLANNING_STAGE = "PLANNING_ESCALATION"
+
+
+def is_orange_replan_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Whether a task belongs to a Planner-governed orange repair round."""
+    row = conn.execute(
+        "SELECT root_task_id, repair_stage FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    return bool(row and row["root_task_id"] and row["repair_stage"] == _ORANGE_PLANNING_STAGE)
+
+
+def _require_orange_planner_actor(
+    conn: sqlite3.Connection, task_ids: Iterable[str], *, actor_task_id: Optional[str],
+    actor_run_id: Optional[int],
+) -> Optional[sqlite3.Row]:
+    """Require the active Planner run when a mutation touches orange lineage.
+
+    Ordinary cards have no repair root/stage and remain callable by every
+    existing CLI, dashboard and tool surface. Orange cards carry the durable
+    lineage copied from their Planner parent, so neither a stale profile string
+    nor linking a pre-existing ordinary card can bypass the check.
+    """
+    ids = tuple(dict.fromkeys(str(task_id) for task_id in task_ids if task_id))
+    if not ids:
+        return None
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT id, root_task_id, repair_round, repair_stage FROM tasks WHERE id IN ({placeholders})",
+        ids,
+    ).fetchall()
+    rounds = {
+        (row["root_task_id"], int(row["repair_round"] or 0))
+        for row in rows
+        if row["root_task_id"] and row["repair_stage"] == _ORANGE_PLANNING_STAGE
+    }
+    if not rounds:
+        return None
+    if len(rounds) != 1:
+        raise PermissionError("orange subcards from different repair rounds cannot be linked")
+    root_task_id, repair_round = next(iter(rounds))
+    planner = conn.execute(
+        """
+        SELECT id, current_run_id, repair_depth, repair_round, repair_stage, root_task_id
+          FROM tasks
+         WHERE assignee = 'planner' AND status = 'running'
+           AND root_task_id = ? AND repair_round = ? AND repair_stage = ?
+         ORDER BY created_at DESC LIMIT 1
+        """,
+        (root_task_id, repair_round, _ORANGE_PLANNING_STAGE),
+    ).fetchone()
+    try:
+        supplied_run_id = int(actor_run_id) if actor_run_id is not None else None
+    except (TypeError, ValueError):
+        supplied_run_id = None
+    if (
+        planner is None
+        or not actor_task_id
+        or actor_task_id != planner["id"]
+        or supplied_run_id != planner["current_run_id"]
+    ):
+        raise PermissionError(
+            "orange subcards require the expected Planner run for their repair round")
+    return planner
 
 
 def _missing_task_ids(conn: sqlite3.Connection, ids: Iterable[str]) -> list[str]:
@@ -1611,16 +1684,34 @@ def set_reasoning_effort(conn: sqlite3.Connection, task_id: str, effort: Optiona
 
 # --- Links ---
 
-def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+def link_tasks(
+    conn: sqlite3.Connection, parent_id: str, child_id: str, *,
+    actor_task_id: Optional[str] = None, actor_run_id: Optional[int] = None,
+) -> None:
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
     with write_txn(conn):
         missing = _missing_task_ids(conn, [parent_id, child_id])
         if missing:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
+        orange_actor = _require_orange_planner_actor(
+            conn, (parent_id, child_id), actor_task_id=actor_task_id, actor_run_id=actor_run_id,
+        )
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
         _link(conn, parent_id, child_id)
+        if orange_actor is not None:
+            conn.execute(
+                """
+                UPDATE tasks
+                   SET repair_depth = ?, repair_round = ?, repair_stage = ?, root_task_id = ?
+                 WHERE id IN (?, ?) AND root_task_id IS NULL
+                """,
+                (
+                    int(orange_actor["repair_depth"] or 0), int(orange_actor["repair_round"] or 0),
+                    orange_actor["repair_stage"], orange_actor["root_task_id"], parent_id, child_id,
+                ),
+            )
         # If child was ready but parent is not yet done, demote child to todo.
         if _task_status(conn, parent_id) != "done":
             conn.execute(

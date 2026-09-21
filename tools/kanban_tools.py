@@ -906,7 +906,8 @@ def _handle_create(args: dict, **kw) -> str:
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
             initial_status=str(args.get("initial_status") or "running"),
-            created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id)
+            created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id,
+            actor_task_id=self_tid, actor_run_id=_worker_run_id(self_tid) if self_tid else None)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         return _ok(task_id=new_tid, **landed, subscribed=_maybe_auto_subscribe(conn, new_tid))
 
@@ -1043,7 +1044,13 @@ def _handle_link(args: dict, **kw) -> str:
     child_id = args.get("child_id")
     _check(parent_id and child_id, "both parent_id and child_id are required")
     with _board(args.get("board")) as (kb, conn):
-        kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
+        actor_task_id = (os.environ.get("HERMES_KANBAN_TASK")
+                         if _is_dispatcher_owned_worker() else None)
+        kb.link_tasks(
+            conn, parent_id=parent_id, child_id=child_id,
+            actor_task_id=actor_task_id,
+            actor_run_id=_worker_run_id(actor_task_id) if actor_task_id else None,
+        )
         return _ok(parent_id=parent_id, child_id=child_id)
 
 
