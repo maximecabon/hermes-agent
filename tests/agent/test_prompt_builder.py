@@ -90,6 +90,7 @@ class TestGuidanceConstants:
 
         assert "active Planner run" in KANBAN_GUIDANCE
         assert "orange subcards" in KANBAN_GUIDANCE
+        assert "repair budget" in KANBAN_GUIDANCE
 
 
 # =========================================================================

@@ -2203,7 +2203,7 @@ def needs_replan(
         source = conn.execute(
             """
             SELECT id, status, current_run_id, repair_depth, repair_round,
-                   root_task_id, tenant
+                   repair_stage, root_task_id, tenant
               FROM tasks
              WHERE id = ?
             """,
@@ -2211,7 +2211,17 @@ def needs_replan(
         ).fetchone()
         if source is None:
             return None
+        source_root_task_id = _row_get(source, "root_task_id")
+        root_task_id = source_root_task_id or task_id
         repair_round = int(source["repair_round"] or 0)
+        # The root source starts its first wave at 1 and advances only after a
+        # completed verify fan-in.  Existing non-root sources retain their
+        # durable round for replay compatibility with the I05 contract.
+        if not source_root_task_id or (
+            source_root_task_id == task_id and source["repair_stage"] == "VERIFY"
+        ):
+            repair_round += 1
+        max_rewrites = _orange_max_rewrites()
         replan_key = f"replan:{task_id}:{repair_round}"
         existing = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
@@ -2228,7 +2238,42 @@ def needs_replan(
         ):
             return None
 
-        root_task_id = _row_get(source, "root_task_id") or task_id
+        if repair_round > max_rewrites:
+            changed = conn.execute(
+                """
+                UPDATE tasks
+                   SET status = 'blocked', claim_lock = NULL, claim_expires = NULL,
+                       worker_pid = NULL, repair_stage = 'PLANNING_ESCALATION',
+                       repair_round = ?, root_task_id = ?
+                 WHERE id = ? AND status = 'running' AND current_run_id = ?
+                """,
+                (repair_round, root_task_id, task_id, active_run_id),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("needs_replan budget state changed during transition")
+            closed_run_id = _end_run(
+                conn, task_id, outcome="budget_exhausted", status="blocked",
+                summary="Orange repair budget exhausted; Planner escalation required.",
+                metadata={
+                    "findings": normalized_findings,
+                    "max_rewrites": max_rewrites,
+                    "repair_round": repair_round,
+                    "root_task_id": root_task_id,
+                },
+            )
+            if closed_run_id is None:
+                raise RuntimeError("needs_replan source run disappeared during budget escalation")
+            _append_event(
+                conn, task_id, "budget_exhausted",
+                {
+                    "findings": normalized_findings,
+                    "max_rewrites": max_rewrites,
+                    "repair_round": repair_round,
+                    "root_task_id": root_task_id,
+                },
+                run_id=closed_run_id,
+            )
+            return None
         conn.executemany(
             "INSERT OR IGNORE INTO kanban_orange_findings "
             "(root_task_id, repair_round, finding_id, source_task_id, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -2263,10 +2308,11 @@ def needs_replan(
             """
             UPDATE tasks
                SET status = 'todo', claim_lock = NULL, claim_expires = NULL,
-                   worker_pid = NULL, repair_stage = 'PLANNING_ESCALATION'
+                   worker_pid = NULL, repair_stage = 'PLANNING_ESCALATION',
+                   repair_round = ?, root_task_id = ?
              WHERE id = ? AND status = 'running' AND current_run_id = ?
             """,
-            (task_id, active_run_id),
+            (repair_round, root_task_id, task_id, active_run_id),
         ).rowcount
         if changed != 1:
             raise RuntimeError("needs_replan source state changed during transition")
@@ -2501,6 +2547,110 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     return "ready"
 
 
+def _orange_max_rewrites() -> int:
+    """Configured, fail-closed bounded repair budget (minimum one wave)."""
+    from hermes_cli.config import cfg_get, load_config_readonly
+
+    raw = cfg_get(load_config_readonly(), "kanban", "max_rewrites", default=2)
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return 2
+
+
+def _orange_fan_in_planner(conn: sqlite3.Connection, task_id: str) -> Optional[sqlite3.Row]:
+    """Planner parent governing the source task's current orange wave, if any."""
+    return conn.execute(
+        """
+        SELECT p.id, p.root_task_id, p.repair_round
+          FROM task_links AS l
+          JOIN tasks AS p ON p.id = l.parent_id
+         WHERE l.child_id = ?
+           AND p.repair_stage = ?
+         ORDER BY p.created_at DESC, p.id DESC
+         LIMIT 1
+        """,
+        (task_id, _ORANGE_PLANNING_STAGE),
+    ).fetchone()
+
+
+def _orange_fan_in_if_complete(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Promote one fully-completed Planner wave back to specialist verification.
+
+    The source card remains dependency-gated behind its Planner parent, while
+    the repair subcards are siblings of that source.  Consequently the generic
+    parent check alone is insufficient: it would make the source ready as soon
+    as the Planner is done.  This reducer holds it until every persisted finding
+    coverage child is terminal, then emits exactly one durable fan-in event.
+    """
+    task = conn.execute(
+        "SELECT status, repair_stage, root_task_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if task is None or task["status"] not in {"todo", "blocked"}:
+        return False
+    if task["repair_stage"] != _ORANGE_PLANNING_STAGE:
+        return False
+    planner = _orange_fan_in_planner(conn, task_id)
+    if planner is None or planner["root_task_id"] != (task["root_task_id"] or task_id):
+        return False
+    # Specialist subcards inherit the Planner's stage too, but are coverage
+    # members rather than the root source that must wait for fan-in.
+    if conn.execute(
+        "SELECT 1 FROM kanban_orange_finding_coverage "
+        "WHERE root_task_id = ? AND repair_round = ? AND child_task_id = ? LIMIT 1",
+        (planner["root_task_id"], int(planner["repair_round"] or 0), task_id),
+    ).fetchone() is not None:
+        return False
+    if _task_status(conn, planner["id"]) not in {"done", "archived"}:
+        return False
+    try:
+        coverage = require_orange_finding_coverage(conn, planner["id"])
+    except ValueError:
+        # A Planner may not be handed off before this gate, but preserve the
+        # durable hold rather than letting a legacy/direct DB mutation spawn a
+        # specialist with an incomplete finding matrix.
+        return False
+    child_ids = sorted({child_id for ids in coverage.values() for child_id in ids})
+    if not child_ids:
+        return False
+    placeholders = ",".join("?" for _ in child_ids)
+    unfinished = conn.execute(
+        f"SELECT 1 FROM tasks WHERE id IN ({placeholders}) "
+        "AND status NOT IN ('done', 'archived') LIMIT 1", child_ids,
+    ).fetchone()
+    if unfinished is not None:
+        return False
+    prior_review = _latest_event(conn, task_id, "review_requested")
+    implementer = _json_dict(_row_get(prior_review, "payload")).get("implementer")
+    implementer = implementer if isinstance(implementer, str) and implementer.strip() else None
+    changed = conn.execute(
+        """
+        UPDATE tasks
+           SET status = 'ready', repair_stage = 'VERIFY', root_task_id = ?,
+               assignee = COALESCE(?, assignee)
+         WHERE id = ? AND status IN ('todo', 'blocked')
+           AND repair_stage = ?
+        """,
+        (planner["root_task_id"], implementer, task_id, _ORANGE_PLANNING_STAGE),
+    ).rowcount
+    if changed != 1:
+        return False
+    _append_event(
+        conn, task_id, "orange_fan_in_ready",
+        {
+            "planner_task_id": planner["id"],
+            "root_task_id": planner["root_task_id"],
+            "repair_round": int(planner["repair_round"] or 0),
+            "child_task_ids": child_ids,
+            "coverage": coverage,
+            "implementer": implementer,
+            "status": "ready",
+            "repair_stage": "VERIFY",
+        },
+    )
+    return True
+
+
 def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
     """Promote ``todo``/``blocked`` tasks whose parents are all done/archived;
     returns the count. Opens its own IMMEDIATE txn — call OUTSIDE any write txn.
@@ -2524,6 +2674,25 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            # Orange sources have a sibling specialist wave.  They must never
+            # be admitted merely because their Planner parent finished.
+            if _orange_fan_in_if_complete(conn, task_id):
+                promoted += 1
+                continue
+            current = conn.execute(
+                "SELECT repair_stage, root_task_id, repair_round FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            is_covered_child = current is not None and conn.execute(
+                "SELECT 1 FROM kanban_orange_finding_coverage "
+                "WHERE root_task_id = ? AND repair_round = ? AND child_task_id = ? LIMIT 1",
+                (current["root_task_id"], int(current["repair_round"] or 0), task_id),
+            ).fetchone() is not None
+            if (
+                current is not None
+                and current["repair_stage"] == _ORANGE_PLANNING_STAGE
+                and not is_covered_child
+            ):
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Explicit human-intervention block; only ``unblock_task`` may exit it.
                 continue
@@ -3579,6 +3748,10 @@ def request_review(
             ).fetchone()
             if trow is None:
                 return _ret(False, "task not found")
+            if is_orange_replan_task(conn, task_id):
+                # The Planner cannot hand a wave to review until every durable
+                # finding is represented by at least one specialist subcard.
+                require_orange_finding_coverage(conn, task_id)
             # Refuse to clear a live worker's claim without proof of ownership
             # (expected_run_id) or an explicit human override (force=True).
             if (
@@ -3659,11 +3832,17 @@ def _prior_reviewer(conn: sqlite3.Connection, task_id: str):
         "WHERE task_id = ? AND outcome = 'changes_requested' "
         "ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
-    if changes_run is None:
-        return None
-    changes_event = _latest_event(conn, task_id, "changes_requested", changes_run["id"])
-    reviewer = _json_dict(_row_get(changes_event, "payload")).get("reviewer")
-    return reviewer if isinstance(reviewer, str) and reviewer.strip() else False
+    if changes_run is not None:
+        changes_event = _latest_event(conn, task_id, "changes_requested", changes_run["id"])
+        reviewer = _json_dict(_row_get(changes_event, "payload")).get("reviewer")
+        return reviewer if isinstance(reviewer, str) and reviewer.strip() else False
+    # Orange verify follows a prior reviewer-driven replan, not necessarily a
+    # changes_requested handoff.  Preserve that original reviewer so fan-in
+    # returns to the same independent review lane without requiring callers to
+    # know a hidden profile name.
+    requested_event = _latest_event(conn, task_id, "review_requested")
+    reviewer = _json_dict(_row_get(requested_event, "payload")).get("reviewer")
+    return reviewer if isinstance(reviewer, str) and reviewer.strip() else None
 
 
 def _nonblank_str(value: Any) -> Optional[str]:

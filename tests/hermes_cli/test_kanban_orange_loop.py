@@ -7,6 +7,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli.config_defaults import DEFAULT_CONFIG
@@ -380,3 +382,180 @@ def test_orange_findings_are_persisted_covered_and_replay_stable(tmp_path: Path)
         "LOOP-002": [loop_child],
         "TECH-001": [tech_child],
     }
+
+
+def _planned_orange_wave(conn) -> tuple[str, str, list[str]]:
+    """Create one review finding -> Planner -> specialist-wave lineage."""
+    root_id = kb.create_task(conn, title="Root implementation", assignee="builder")
+    implementation = kb.claim_task(conn, root_id, claimer="builder:implementation")
+    assert implementation is not None
+    assert kb.request_review(
+        conn, root_id, summary="initial implementation", reviewer="reviewer",
+        expected_run_id=implementation.current_run_id,
+    )
+    review = kb.claim_review_task(conn, root_id, claimer="reviewer:initial")
+    assert review is not None
+    planner_id = kb.needs_replan(
+        conn, root_id, findings=["TECH-001", "LOOP-002"], expected_run_id=review.current_run_id,
+    )
+    assert planner_id is not None
+    planner = kb.claim_task(conn, planner_id, claimer="planner:wave")
+    assert planner is not None
+    child_ids = [
+        kb.create_task(
+            conn, title=f"Repair {finding}", assignee="builder", parents=[planner_id],
+            finding_ids=[finding], actor_task_id=planner_id, actor_run_id=planner.current_run_id,
+        )
+        for finding in ("TECH-001", "LOOP-002")
+    ]
+    return root_id, planner_id, child_ids
+
+
+def test_orange_fan_in_holds_root_then_restores_specialist_and_reviewer(tmp_path: Path) -> None:
+    with kbc.connect_closing(tmp_path / "kanban.db") as conn:
+        root_id, planner_id, child_ids = _planned_orange_wave(conn)
+        planner = kb.get_task(conn, planner_id)
+        assert planner is not None
+        assert kb.request_review(
+            conn, planner_id, summary="wave planned", reviewer="reviewer",
+            expected_run_id=planner.current_run_id,
+        )
+        assert kb.complete_task(conn, planner_id, summary="wave approved")
+
+        root = kb.get_task(conn, root_id)
+        assert root is not None
+        assert (root.status, root.repair_stage) == ("todo", "PLANNING_ESCALATION")
+
+        first_child = kb.claim_task(conn, child_ids[0], claimer="builder:first")
+        assert first_child is not None
+        assert kb.complete_task(conn, child_ids[0], expected_run_id=first_child.current_run_id)
+        root = kb.get_task(conn, root_id)
+        assert root is not None
+        assert (root.status, root.repair_stage) == ("todo", "PLANNING_ESCALATION")
+
+        second_child = kb.claim_task(conn, child_ids[1], claimer="builder:second")
+        assert second_child is not None
+        assert kb.complete_task(conn, child_ids[1], expected_run_id=second_child.current_run_id)
+
+        root = kb.get_task(conn, root_id)
+        assert root is not None
+        assert (root.status, root.assignee, root.repair_stage) == ("ready", "builder", "VERIFY")
+        fan_in_events = [event for event in kb.list_events(conn, root_id) if event.kind == "orange_fan_in_ready"]
+        assert len(fan_in_events) == 1
+        assert kb.recompute_ready(conn) == 0
+        assert len([event for event in kb.list_events(conn, root_id) if event.kind == "orange_fan_in_ready"]) == 1
+
+        verify = kb.claim_task(conn, root_id, claimer="builder:verify")
+        assert verify is not None
+        assert kb.request_review(
+            conn, root_id, summary="repair verified", expected_run_id=verify.current_run_id,
+        )
+        root = kb.get_task(conn, root_id)
+        assert root is not None
+        assert (root.status, root.assignee, root.repair_stage) == ("review", "reviewer", "VERIFY")
+
+
+def test_orange_request_review_refuses_uncovered_wave(tmp_path: Path) -> None:
+    with kbc.connect_closing(tmp_path / "kanban.db") as conn:
+        source_id, source_run_id = _claimed_replan_source(conn)
+        planner_id = kb.needs_replan(
+            conn, source_id, findings=["TECH-001"], expected_run_id=source_run_id,
+        )
+        assert planner_id is not None
+        planner = kb.claim_task(conn, planner_id, claimer="planner:uncovered")
+        assert planner is not None
+
+        with pytest.raises(ValueError, match="coverage"):
+            kb.request_review(
+                conn, planner_id, summary="cannot hand off", expected_run_id=planner.current_run_id,
+            )
+        assert kb.get_task(conn, planner_id).status == "running"
+
+
+def test_orange_budget_exhaustion_persists_escalation_without_new_card_or_run(tmp_path: Path) -> None:
+    with kbc.connect_closing(tmp_path / "kanban.db") as conn:
+        source_id = kb.create_task(
+            conn, title="Exhausted root", assignee="builder", repair_round=3,
+            repair_stage="VERIFY", root_task_id="t_root",
+        )
+        claimed = kb.claim_task(conn, source_id, claimer="builder:exhausted")
+        assert claimed is not None
+        tasks_before = conn.execute("SELECT COUNT(*) AS count FROM tasks").fetchone()["count"]
+        runs_before = conn.execute("SELECT COUNT(*) AS count FROM task_runs").fetchone()["count"]
+
+        assert kb.needs_replan(
+            conn, source_id, findings=["TECH-003"], expected_run_id=claimed.current_run_id,
+        ) is None
+
+        source = kb.get_task(conn, source_id)
+        assert source is not None
+        assert (source.status, source.repair_stage, source.current_run_id) == (
+            "blocked", "PLANNING_ESCALATION", None,
+        )
+        assert conn.execute("SELECT COUNT(*) AS count FROM tasks").fetchone()["count"] == tasks_before
+        assert conn.execute("SELECT COUNT(*) AS count FROM task_runs").fetchone()["count"] == runs_before
+        assert [event.payload for event in kb.list_events(conn, source_id) if event.kind == "budget_exhausted"] == [{
+            "findings": ["TECH-003"], "max_rewrites": 2, "repair_round": 3, "root_task_id": "t_root",
+        }]
+
+
+def test_orange_allows_two_root_waves_then_blocks_the_third_without_spawning(tmp_path: Path) -> None:
+    with kbc.connect_closing(tmp_path / "kanban.db") as conn:
+        root_id, first_planner_id, first_children = _planned_orange_wave(conn)
+        first_planner = kb.get_task(conn, first_planner_id)
+        assert first_planner is not None
+        assert kb.request_review(
+            conn, first_planner_id, reviewer="reviewer", expected_run_id=first_planner.current_run_id,
+        )
+        assert kb.complete_task(conn, first_planner_id)
+        for child_id in first_children:
+            child = kb.claim_task(conn, child_id, claimer=f"builder:{child_id}")
+            assert child is not None
+            assert kb.complete_task(conn, child_id, expected_run_id=child.current_run_id)
+        root = kb.get_task(conn, root_id)
+        assert root is not None and (root.status, root.repair_round) == ("ready", 1)
+
+        first_verify = kb.claim_task(conn, root_id, claimer="builder:verify-one")
+        assert first_verify is not None
+        assert kb.request_review(conn, root_id, expected_run_id=first_verify.current_run_id)
+        first_review = kb.claim_review_task(conn, root_id, claimer="reviewer:one")
+        assert first_review is not None
+        second_planner_id = kb.needs_replan(
+            conn, root_id, findings=["TECH-002"], expected_run_id=first_review.current_run_id,
+        )
+        assert second_planner_id is not None
+        second_planner = kb.claim_task(conn, second_planner_id, claimer="planner:two")
+        assert second_planner is not None
+        second_child_id = kb.create_task(
+            conn, title="Repair TECH-002", assignee="builder", parents=[second_planner_id],
+            finding_ids=["TECH-002"], actor_task_id=second_planner_id,
+            actor_run_id=second_planner.current_run_id,
+        )
+        assert kb.request_review(
+            conn, second_planner_id, reviewer="reviewer", expected_run_id=second_planner.current_run_id,
+        )
+        assert kb.complete_task(conn, second_planner_id)
+        second_child = kb.claim_task(conn, second_child_id, claimer="builder:two")
+        assert second_child is not None
+        assert kb.complete_task(conn, second_child_id, expected_run_id=second_child.current_run_id)
+        root = kb.get_task(conn, root_id)
+        assert root is not None and (root.status, root.repair_round, root.repair_stage) == (
+            "ready", 2, "VERIFY",
+        )
+
+        second_verify = kb.claim_task(conn, root_id, claimer="builder:verify-two")
+        assert second_verify is not None
+        assert kb.request_review(conn, root_id, expected_run_id=second_verify.current_run_id)
+        exhausted_review = kb.claim_review_task(conn, root_id, claimer="reviewer:two")
+        assert exhausted_review is not None
+        task_count = conn.execute("SELECT COUNT(*) AS count FROM tasks").fetchone()["count"]
+        run_count = conn.execute("SELECT COUNT(*) AS count FROM task_runs").fetchone()["count"]
+        assert kb.needs_replan(
+            conn, root_id, findings=["TECH-003"], expected_run_id=exhausted_review.current_run_id,
+        ) is None
+        root = kb.get_task(conn, root_id)
+        assert root is not None and (root.status, root.repair_round, root.repair_stage, root.current_run_id) == (
+            "blocked", 3, "PLANNING_ESCALATION", None,
+        )
+        assert conn.execute("SELECT COUNT(*) AS count FROM tasks").fetchone()["count"] == task_count
+        assert conn.execute("SELECT COUNT(*) AS count FROM task_runs").fetchone()["count"] == run_count
