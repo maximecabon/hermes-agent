@@ -194,6 +194,16 @@ KANBAN_BLOCK_SCHEMA = _schema(
                 "Omit only if none apply."
             ),
         },
+        "question": {
+            "type": "object",
+            "description": (
+                "Required with kind='needs_input'. Closed typed Human Wait question: "
+                "schema_version='kanban.human_question.v1', question_id, audience "
+                "(HUMAN|EXPERT), prompt, answer_kind (TEXT|CHOICE), choices, required, "
+                "context and canonical question_sha256. Persisted atomically with the "
+                "block and correlated to task/root task; lifecycle events omit prompt text."
+            ),
+        },
     },
     ["reason"],
 )

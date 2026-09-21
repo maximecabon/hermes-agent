@@ -622,6 +622,11 @@ def _handle_block(args: dict, **kw) -> str:
     reason = _redact(
         _require_text(args, "reason", "reason is required — explain what input you need"))
     kind = args.get("kind")
+    human_question = args.get("question")
+    _check(kind != "needs_input" or human_question is not None,
+           "question is required with kind='needs_input'")
+    _check(human_question is None or kind == "needs_input",
+           "question is only valid with kind='needs_input'")
     with _board(args.get("board")) as (kb, conn):
         _check(kind is None or kind in kb.VALID_BLOCK_KINDS,
                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)")
@@ -641,9 +646,16 @@ def _handle_block(args: dict, **kw) -> str:
                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
                f"finished or cannot proceed for another reason, call kanban_complete instead — "
                f"the completion judge will evaluate it.")
-        ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
+        ok = kb.block_task(
+            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid),
+            human_question=human_question,
+        )
         _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
-        return _ok_landed(kb, conn, tid, "blocked", block_kind=kind)
+        landed_kind = kb.get_task(conn, tid).block_kind
+        extra: dict = {"block_kind": landed_kind}
+        if human_question is not None:
+            extra["question_id"] = human_question.get("question_id") if isinstance(human_question, dict) else None
+        return _ok_landed(kb, conn, tid, "blocked", **extra)
 
 
 @_kanban_handler("kanban_request_review")
