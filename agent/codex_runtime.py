@@ -298,6 +298,9 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         args = _codex_item_to_args(item)
         if item_id:
             started[item_id] = (name, args, time.monotonic())
+        # Keep the existing activity field current for the common snapshot adapter;
+        # names are normalized at the adapter boundary and no arguments are retained.
+        agent._current_tool = name
         agent_cb("tool_progress_callback", "tool_progress_callback raised on tool.started for %s", name,
                  args=("tool.started", name, _codex_item_to_preview(item), args))
         # Stable-ID tool card (TUI/desktop) fires alongside the progress bubble.
@@ -317,6 +320,8 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
                  args=("tool.completed", name, None, None),
                  kwargs={"duration": duration, "is_error": is_error, "result": result})
         args = prior[1] if prior is not None else _codex_item_to_args(item)
+        if getattr(agent, "_current_tool", None) == name:
+            agent._current_tool = next((active[0] for active in started.values()), None)
         agent_cb("tool_complete_callback", "tool_complete_callback raised for %s", name,
                  args=(_stable_call_id(item, name), name, args, result))
 
@@ -357,6 +362,38 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
             params = note.get("params")
             handler(params if isinstance(params, dict) else {})
     return on_event
+
+
+def build_codex_app_server_activity_snapshot(agent, *, turn=None) -> dict:
+    """Adapt Codex app-server state into exactly the standard ``agent_activity/v1`` shape."""
+    from agent.session_activity import infer_activity_waiting_for, normalize_agent_activity_snapshot
+
+    usage = getattr(turn, "token_usage_last", None) if turn is not None else None
+    usage = usage if isinstance(usage, dict) else {}
+    compressor = getattr(agent, "context_compressor", None)
+    return normalize_agent_activity_snapshot(
+        runtime="codex_app_server",
+        tool=getattr(agent, "_current_tool", None),
+        waiting_for=(
+            getattr(agent, "_activity_waiting_for", None)
+            or infer_activity_waiting_for(getattr(agent, "_last_activity_desc", None))
+        ),
+        error=getattr(turn, "error", None) if turn is not None else getattr(agent, "_last_activity_error", None),
+        tokens={
+            "input": usage.get("inputTokens", getattr(agent, "session_input_tokens", 0)),
+            "output": usage.get("outputTokens", getattr(agent, "session_output_tokens", 0)),
+            "total": usage.get("totalTokens", getattr(agent, "session_total_tokens", 0)),
+        },
+        limits={
+            "iterations_used": getattr(agent, "_api_call_count", 0),
+            "iterations_max": getattr(agent, "max_iterations", None),
+            "context_window": (
+                getattr(turn, "model_context_window", None)
+                if getattr(turn, "model_context_window", None) is not None
+                else getattr(compressor, "context_length", None)
+            ),
+        },
+    )
 
 
 # --- Codex app-server turn ----------------------------------------------------
@@ -477,16 +514,22 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         from agent.conversation_compression import _checkpoint_blocked
         raise _checkpoint_blocked("codex_app_server owns the authoritative thread and compacts it "
                                   "without a truthful pre-compaction transcript boundary")
-    _ensure_codex_session(agent)
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        from agent.session_activity import activity_error_kind, activity_waiting_for
+        with activity_waiting_for(agent, "codex"):
+            _ensure_codex_session(agent)
+            turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
+        agent._last_activity_error = activity_error_kind(exc)
+        agent._current_tool = None
         _close_codex_session(agent)
         return _turn_result(
             _consume_user_interrupt(agent), messages, api_calls=0, completed=False, error=str(exc),
             final_response=f"Codex app-server turn failed: {exc}. Fall back to default runtime with `/codex-runtime auto`.",
         )
+    agent._last_activity_error = activity_error_kind(turn.error)
+    agent._current_tool = None
     interrupt = _consume_user_interrupt(agent, turn.interrupted)
     # Wedged client (deadline blown, watchdog tripped, OAuth refresh died, subprocess exited): retire it.
     if getattr(turn, "should_retire", False):

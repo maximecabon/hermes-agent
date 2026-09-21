@@ -6,11 +6,44 @@ from __future__ import annotations
 
 import sys
 import time
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from enum import Enum
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, TypedDict
 
 ACTIVITY_DESCRIPTION_MAX = 120
+AGENT_ACTIVITY_SCHEMA_VERSION = "agent_activity/v1"
+AGENT_ACTIVITY_COUNT_MAX = 2_147_483_647
+
+# A snapshot may name a tool, but never carries its arguments, payload, environment,
+# or result. Unknown/dynamic names collapse to ``other`` rather than becoming a
+# side-channel for remote server names or user-provided tool labels.
+_AGENT_ACTIVITY_TOOL_ALLOWLIST = frozenset({
+    "terminal", "read_file", "write_file", "patch", "web_search", "web_extract",
+    "browser", "execute_code", "exec_command", "apply_patch", "delegate_task",
+})
+_AGENT_ACTIVITY_WAITING_FOR_ALLOWLIST = frozenset({"provider", "tool", "approval", "codex"})
+
+
+class AgentActivityTokens(TypedDict):
+    input: int
+    output: int
+    total: int
+
+
+class AgentActivityLimits(TypedDict):
+    iterations_used: int
+    iterations_max: int | None
+    context_window: int | None
+
+
+class AgentActivitySnapshotV1(TypedDict):
+    schema_version: str
+    runtime: str
+    tool: str | None
+    waiting_for: str | None
+    error: str | None
+    tokens: AgentActivityTokens
+    limits: AgentActivityLimits
 
 # Durable SessionDB heartbeat cadence. Contract: MUST stay >= 30s — the SessionDB write path is contended and
 # this observation-only projection never justifies extra write pressure. A code constant on purpose (no config
@@ -44,6 +77,97 @@ def normalize_activity_provenance(provenance: Optional[ActivityProvenance | str]
         return ActivityProvenance((provenance or "").strip())
     except ValueError:
         return ActivityProvenance.UNKNOWN
+
+
+def _bounded_activity_count(value: Any, *, allow_none: bool = False) -> int | None:
+    if value is None and allow_none:
+        return None
+    try:
+        return min(AGENT_ACTIVITY_COUNT_MAX, max(0, int(value)))
+    except (TypeError, ValueError, OverflowError):
+        return None if allow_none else 0
+
+
+def _safe_activity_tool(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value) if str(value) in _AGENT_ACTIVITY_TOOL_ALLOWLIST else "other"
+
+
+def _safe_activity_waiting_for(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value) if str(value) in _AGENT_ACTIVITY_WAITING_FOR_ALLOWLIST else None
+
+
+def activity_error_kind(error: Any) -> str | None:
+    """Classify an error without returning its text, payload, or exception args."""
+    if error is None or error == "":
+        return None
+    kind = (error if isinstance(error, str) else type(error).__name__).lower()
+    if "oauth" in kind:
+        return "oauth_error"
+    if "auth" in kind or "permission" in kind:
+        return "auth_error"
+    if "timeout" in kind:
+        return "timeout"
+    if "rate" in kind or "quota" in kind:
+        return "rate_limit"
+    if "tool" in kind:
+        return "tool_error"
+    return "runtime_error"
+
+
+def infer_activity_waiting_for(description: Any) -> str | None:
+    """Map existing activity labels to the closed waiting vocabulary without exporting their text."""
+    text = str(description or "").lower()
+    if "waiting" in text or "receiving stream" in text or "local model loading" in text:
+        return "provider"
+    return None
+
+
+@contextmanager
+def activity_waiting_for(agent: Any, waiting_for: str):
+    """Set the observation-only wait state and clear it unconditionally at the turn boundary."""
+    agent._activity_waiting_for = _safe_activity_waiting_for(waiting_for)
+    try:
+        yield
+    finally:
+        agent._activity_waiting_for = None
+
+
+def normalize_agent_activity_snapshot(
+    *, runtime: Any, tool: Any = None, waiting_for: Any = None, error: Any = None,
+    tokens: Mapping[str, Any] | None = None, limits: Mapping[str, Any] | None = None,
+    **_ignored_payload: Any,
+) -> AgentActivitySnapshotV1:
+    """Return the sole, bounded, payload-free ``agent_activity/v1`` projection."""
+    token_values = tokens if isinstance(tokens, Mapping) else {}
+    limit_values = limits if isinstance(limits, Mapping) else {}
+    raw_iterations_max = limit_values.get("iterations_max")
+    try:
+        iterations_max = None if int(raw_iterations_max) >= sys.maxsize else _bounded_activity_count(
+            raw_iterations_max, allow_none=True
+        )
+    except (TypeError, ValueError, OverflowError):
+        iterations_max = _bounded_activity_count(raw_iterations_max, allow_none=True)
+    return {
+        "schema_version": AGENT_ACTIVITY_SCHEMA_VERSION,
+        "runtime": "codex_app_server" if runtime == "codex_app_server" else "hermes",
+        "tool": _safe_activity_tool(tool),
+        "waiting_for": _safe_activity_waiting_for(waiting_for),
+        "error": activity_error_kind(error),
+        "tokens": {
+            "input": _bounded_activity_count(token_values.get("input")) or 0,
+            "output": _bounded_activity_count(token_values.get("output")) or 0,
+            "total": _bounded_activity_count(token_values.get("total")) or 0,
+        },
+        "limits": {
+            "iterations_used": _bounded_activity_count(limit_values.get("iterations_used")) or 0,
+            "iterations_max": iterations_max,
+            "context_window": _bounded_activity_count(limit_values.get("context_window"), allow_none=True),
+        },
+    }
 
 
 def format_iteration_progress(api_call_count: Any, max_iterations: Any) -> str:

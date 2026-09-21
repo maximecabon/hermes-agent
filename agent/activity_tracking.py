@@ -10,10 +10,42 @@ import time
 from contextlib import suppress
 from typing import Optional
 
-from agent.session_activity import ActivityProvenance
+from agent.session_activity import (
+    ActivityProvenance,
+    infer_activity_waiting_for,
+    normalize_agent_activity_snapshot,
+)
 
 # Same logger name as the origin module so log records / caplog filters are unchanged.
 logger = logging.getLogger("run_agent")
+
+
+def build_standard_agent_activity_snapshot(agent) -> dict:
+    """Adapt the standard runtime's existing state into the payload-free activity contract."""
+    compressor = getattr(agent, "context_compressor", None)
+    description = getattr(agent, "_last_activity_desc", None)
+    error = getattr(agent, "_last_activity_error", None)
+    if error is None and "(error)" in str(description or "").lower():
+        error = "tool_error"
+    return normalize_agent_activity_snapshot(
+        runtime="hermes",
+        tool=getattr(agent, "_current_tool", None),
+        waiting_for=(
+            getattr(agent, "_activity_waiting_for", None)
+            or infer_activity_waiting_for(description)
+        ),
+        error=error,
+        tokens={
+            "input": getattr(agent, "session_input_tokens", 0),
+            "output": getattr(agent, "session_output_tokens", 0),
+            "total": getattr(agent, "session_total_tokens", 0),
+        },
+        limits={
+            "iterations_used": getattr(agent, "_api_call_count", 0),
+            "iterations_max": getattr(agent, "max_iterations", None),
+            "context_window": getattr(compressor, "context_length", None),
+        },
+    )
 
 
 def _activity_lock(obj) -> "threading.Lock":
