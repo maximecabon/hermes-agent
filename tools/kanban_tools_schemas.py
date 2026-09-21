@@ -410,6 +410,15 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "synthesizer task."
             ),
         },
+        "finding_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Required for an orange repair subcard: one or more durable "
+                "finding identifiers from the active Planner repair round. "
+                "Unknown or empty coverage is rejected."
+            ),
+        },
         "tenant": _prop("string", (
                 "Optional namespace for multi-project isolation. "
                 "Defaults to HERMES_TENANT env if set."
@@ -577,6 +586,11 @@ KANBAN_LINK_SCHEMA = _schema(
     {
         "parent_id": {"type": "string", "description": "Parent task id."},
         "child_id":  {"type": "string", "description": "Child task id."},
+        "finding_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Finding identifiers covering an existing task newly linked into an orange round.",
+        },
     },
     ["parent_id", "child_id"],
 )

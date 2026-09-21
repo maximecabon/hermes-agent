@@ -300,10 +300,12 @@ def test_only_the_expected_planner_run_can_create_or_link_orange_subcards(tmp_pa
 
         first_child = kb.create_task(
             conn, title="Authorized first child", parents=[planner_id],
+            finding_ids=["TECH-001"],
             actor_task_id=planner_id, actor_run_id=planner.current_run_id,
         )
         second_child = kb.create_task(
             conn, title="Authorized second child", parents=[planner_id],
+            finding_ids=["TECH-001"],
             actor_task_id=planner_id, actor_run_id=planner.current_run_id,
         )
         kb.link_tasks(
@@ -328,3 +330,53 @@ def test_only_the_expected_planner_run_can_create_or_link_orange_subcards(tmp_pa
         assert kb.get_task(conn, first_child).root_task_id == "t_root"
         assert set(kb.parent_ids(conn, second_child)) == {first_child, planner_id}
         assert kb.parent_ids(conn, ordinary_child) == [ordinary_parent]
+
+
+def test_orange_findings_are_persisted_covered_and_replay_stable(tmp_path: Path) -> None:
+    with kbc.connect_closing(tmp_path / "kanban.db") as conn:
+        source_id, source_run_id = _claimed_replan_source(conn)
+        planner_id = kb.needs_replan(
+            conn, source_id, findings=["TECH-001", "LOOP-002"], expected_run_id=source_run_id,
+        )
+        planner = kb.claim_task(conn, planner_id, claimer="planner:test")
+        assert planner is not None
+        assert planner.current_run_id is not None
+
+        try:
+            kb.create_task(
+                conn, title="Uncovered orange child", parents=[planner_id],
+                actor_task_id=planner_id, actor_run_id=planner.current_run_id,
+            )
+        except ValueError as exc:
+            assert "finding_ids" in str(exc)
+        else:
+            raise AssertionError("an orange child without finding coverage must be rejected")
+
+        tech_child = kb.create_task(
+            conn, title="Cover TECH-001", parents=[planner_id], finding_ids=["TECH-001"],
+            idempotency_key="cover:TECH-001",
+            actor_task_id=planner_id, actor_run_id=planner.current_run_id,
+        )
+        try:
+            kb.require_orange_finding_coverage(conn, planner_id)
+        except ValueError as exc:
+            assert "LOOP-002" in str(exc)
+        else:
+            raise AssertionError("an incomplete orange fan-in must be rejected")
+
+        loop_child = kb.create_task(
+            conn, title="Cover LOOP-002", parents=[planner_id], finding_ids=["LOOP-002"],
+            actor_task_id=planner_id, actor_run_id=planner.current_run_id,
+        )
+        replay_child = kb.create_task(
+            conn, title="Cover TECH-001 replay", parents=[planner_id], finding_ids=["TECH-001"],
+            idempotency_key="cover:TECH-001",
+            actor_task_id=planner_id, actor_run_id=planner.current_run_id,
+        )
+        coverage = kb.require_orange_finding_coverage(conn, planner_id)
+
+    assert replay_child == tech_child
+    assert coverage == {
+        "LOOP-002": [loop_child],
+        "TECH-001": [tech_child],
+    }

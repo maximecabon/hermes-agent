@@ -965,6 +965,28 @@ CREATE TABLE IF NOT EXISTS task_links (
     PRIMARY KEY (parent_id, child_id)
 );
 
+-- A blocking finding is durable for one orange repair root/round.  Its raw
+-- stable identifier is deliberately kept out of task bodies so fan-in can
+-- validate coverage without parsing Planner prose.
+CREATE TABLE IF NOT EXISTS kanban_orange_findings (
+    root_task_id   TEXT NOT NULL,
+    repair_round   INTEGER NOT NULL,
+    finding_id     TEXT NOT NULL,
+    source_task_id TEXT NOT NULL,
+    created_at     INTEGER NOT NULL,
+    PRIMARY KEY (root_task_id, repair_round, finding_id)
+);
+
+-- Many findings may need one subcard and one subcard may resolve several
+-- findings. This relation is the durable, queryable coverage matrix.
+CREATE TABLE IF NOT EXISTS kanban_orange_finding_coverage (
+    root_task_id  TEXT NOT NULL,
+    repair_round  INTEGER NOT NULL,
+    finding_id    TEXT NOT NULL,
+    child_task_id TEXT NOT NULL,
+    PRIMARY KEY (root_task_id, repair_round, finding_id, child_task_id)
+);
+
 CREATE TABLE IF NOT EXISTS task_comments (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id    TEXT NOT NULL,
@@ -1065,6 +1087,8 @@ CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
+CREATE INDEX IF NOT EXISTS idx_orange_coverage_child
+    ON kanban_orange_finding_coverage(child_task_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_human_questions_root  ON task_human_questions(root_task_id, created_at);
@@ -1262,6 +1286,7 @@ def create_task(
     completion_contract: Optional[str] = None,
     repair_depth: int = 0, repair_round: int = 0, repair_stage: Optional[str] = None,
     root_task_id: Optional[str] = None,
+    finding_ids: Iterable[str] = (),
     actor_task_id: Optional[str] = None, actor_run_id: Optional[int] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
@@ -1279,7 +1304,8 @@ def create_task(
     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
     An orange replan subcard inherits its repair lineage from a parent and may
-    be created only by that repair round's currently running Planner actor.
+    be created only by that repair round's currently running Planner actor. It
+    must also name at least one durable finding from that round.
     """
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
@@ -1318,6 +1344,7 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
+    normalized_finding_ids = _normalize_orange_finding_ids(finding_ids)
 
     now = int(time.time())
 
@@ -1347,10 +1374,13 @@ def create_task(
                     if row:
                         return row["id"]
                 if orange_actor is not None:
+                    _require_known_orange_findings(conn, orange_actor, normalized_finding_ids)
                     repair_depth = int(orange_actor["repair_depth"] or 0)
                     repair_round = int(orange_actor["repair_round"] or 0)
                     repair_stage = orange_actor["repair_stage"]
                     root_task_id = orange_actor["root_task_id"]
+                elif normalized_finding_ids:
+                    raise ValueError("finding_ids are only valid for orange repair subcards")
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
@@ -1386,6 +1416,8 @@ def create_task(
                 )
                 for pid in parents:
                     _link(conn, pid, task_id)
+                if orange_actor is not None:
+                    _bind_orange_findings(conn, orange_actor, task_id, normalized_finding_ids)
                 _append_event(
                     conn,
                     task_id,
@@ -1444,6 +1476,92 @@ def _link(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
 
 
 _ORANGE_PLANNING_STAGE = "PLANNING_ESCALATION"
+
+
+def _normalize_orange_finding_ids(finding_ids: Iterable[str]) -> list[str]:
+    """Return unique, non-blank finding ids while preserving Planner order."""
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in finding_ids:
+        finding_id = str(raw).strip()
+        if finding_id and finding_id not in seen:
+            normalized.append(finding_id)
+            seen.add(finding_id)
+    return normalized
+
+
+def _require_known_orange_findings(
+    conn: sqlite3.Connection, orange_actor: sqlite3.Row, finding_ids: list[str],
+) -> None:
+    if not finding_ids:
+        raise ValueError("orange repair subcards require non-empty finding_ids")
+    root_task_id = str(orange_actor["root_task_id"])
+    repair_round = int(orange_actor["repair_round"] or 0)
+    placeholders = ",".join("?" for _ in finding_ids)
+    rows = conn.execute(
+        f"SELECT finding_id FROM kanban_orange_findings "
+        f"WHERE root_task_id = ? AND repair_round = ? AND finding_id IN ({placeholders})",
+        (root_task_id, repair_round, *finding_ids),
+    ).fetchall()
+    known = {str(row["finding_id"]) for row in rows}
+    unknown = [finding_id for finding_id in finding_ids if finding_id not in known]
+    if unknown:
+        raise ValueError("unknown orange finding_ids: " + ", ".join(unknown))
+
+
+def _bind_orange_findings(
+    conn: sqlite3.Connection, orange_actor: sqlite3.Row, child_task_id: str, finding_ids: list[str],
+) -> None:
+    root_task_id = str(orange_actor["root_task_id"])
+    repair_round = int(orange_actor["repair_round"] or 0)
+    conn.executemany(
+        "INSERT OR IGNORE INTO kanban_orange_finding_coverage "
+        "(root_task_id, repair_round, finding_id, child_task_id) VALUES (?, ?, ?, ?)",
+        [(root_task_id, repair_round, finding_id, child_task_id) for finding_id in finding_ids],
+    )
+
+
+def _orange_round_context(conn: sqlite3.Connection, task_id: str) -> tuple[str, int]:
+    row = conn.execute(
+        "SELECT root_task_id, repair_round FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None or not row["root_task_id"]:
+        raise ValueError(f"task {task_id} is not part of an orange repair round")
+    return str(row["root_task_id"]), int(row["repair_round"] or 0)
+
+
+def orange_finding_coverage(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
+    """Return the stable findings→subcards matrix for an orange repair round."""
+    root_task_id, repair_round = _orange_round_context(conn, task_id)
+    rows = conn.execute(
+        """
+        SELECT f.finding_id, c.child_task_id
+          FROM kanban_orange_findings AS f
+          LEFT JOIN kanban_orange_finding_coverage AS c
+            ON c.root_task_id = f.root_task_id
+           AND c.repair_round = f.repair_round
+           AND c.finding_id = f.finding_id
+         WHERE f.root_task_id = ? AND f.repair_round = ?
+         ORDER BY f.finding_id, c.child_task_id
+        """,
+        (root_task_id, repair_round),
+    ).fetchall()
+    coverage: dict[str, list[str]] = {}
+    for row in rows:
+        finding_id = str(row["finding_id"])
+        coverage.setdefault(finding_id, [])
+        if row["child_task_id"] is not None:
+            coverage[finding_id].append(str(row["child_task_id"]))
+    return coverage
+
+
+def require_orange_finding_coverage(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
+    """Return coverage or fail closed before an orange fan-in/review transition."""
+    coverage = orange_finding_coverage(conn, task_id)
+    missing = [finding_id for finding_id, child_ids in coverage.items() if not child_ids]
+    if missing:
+        raise ValueError("orange findings lack subcard coverage: " + ", ".join(missing))
+    return coverage
 
 
 def is_orange_replan_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -1686,10 +1804,12 @@ def set_reasoning_effort(conn: sqlite3.Connection, task_id: str, effort: Optiona
 
 def link_tasks(
     conn: sqlite3.Connection, parent_id: str, child_id: str, *,
+    finding_ids: Iterable[str] = (),
     actor_task_id: Optional[str] = None, actor_run_id: Optional[int] = None,
 ) -> None:
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
+    normalized_finding_ids = _normalize_orange_finding_ids(finding_ids)
     with write_txn(conn):
         missing = _missing_task_ids(conn, [parent_id, child_id])
         if missing:
@@ -1697,6 +1817,16 @@ def link_tasks(
         orange_actor = _require_orange_planner_actor(
             conn, (parent_id, child_id), actor_task_id=actor_task_id, actor_run_id=actor_run_id,
         )
+        child_row = conn.execute(
+            "SELECT root_task_id FROM tasks WHERE id = ?", (child_id,),
+        ).fetchone()
+        if orange_actor is not None:
+            if child_row is not None and not child_row["root_task_id"] and not normalized_finding_ids:
+                raise ValueError("orange repair subcards require non-empty finding_ids")
+            if normalized_finding_ids:
+                _require_known_orange_findings(conn, orange_actor, normalized_finding_ids)
+        elif normalized_finding_ids:
+            raise ValueError("finding_ids are only valid for orange repair subcards")
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
         _link(conn, parent_id, child_id)
@@ -1712,6 +1842,8 @@ def link_tasks(
                     orange_actor["repair_stage"], orange_actor["root_task_id"], parent_id, child_id,
                 ),
             )
+            if normalized_finding_ids:
+                _bind_orange_findings(conn, orange_actor, child_id, normalized_finding_ids)
         # If child was ready but parent is not yet done, demote child to todo.
         if _task_status(conn, parent_id) != "done":
             conn.execute(
@@ -2063,7 +2195,7 @@ def needs_replan(
     transaction, so an exception leaves neither a Planner orphan nor a source
     task that can be admitted before its parent exists.
     """
-    normalized_findings = [str(finding).strip() for finding in findings if str(finding).strip()]
+    normalized_findings = _normalize_orange_finding_ids(findings)
     if not normalized_findings:
         raise ValueError("findings must contain at least one non-blank finding")
 
@@ -2097,6 +2229,14 @@ def needs_replan(
             return None
 
         root_task_id = _row_get(source, "root_task_id") or task_id
+        conn.executemany(
+            "INSERT OR IGNORE INTO kanban_orange_findings "
+            "(root_task_id, repair_round, finding_id, source_task_id, created_at) VALUES (?, ?, ?, ?, ?)",
+            [
+                (root_task_id, repair_round, finding_id, task_id, int(time.time()))
+                for finding_id in normalized_findings
+            ],
+        )
         planner_body = json.dumps({
             "schema_version": "kanban.needs_replan.v1",
             "source_task_id": task_id,

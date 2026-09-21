@@ -879,6 +879,7 @@ def _handle_create(args: dict, **kw) -> str:
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
+    finding_ids = _coerce_str_list(args.get("finding_ids") or [], "finding_ids", "finding ids")
     with _board(args.get("board")) as (kb, conn):
         from tools.async_delegation import _current_origin_session_id
         self_tid = (os.environ.get("HERMES_KANBAN_TASK")
@@ -907,6 +908,7 @@ def _handle_create(args: dict, **kw) -> str:
             completion_contract=args.get("completion_contract"),
             initial_status=str(args.get("initial_status") or "running"),
             created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id,
+            finding_ids=finding_ids,
             actor_task_id=self_tid, actor_run_id=_worker_run_id(self_tid) if self_tid else None)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         return _ok(task_id=new_tid, **landed, subscribed=_maybe_auto_subscribe(conn, new_tid))
@@ -1043,11 +1045,13 @@ def _handle_link(args: dict, **kw) -> str:
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
     _check(parent_id and child_id, "both parent_id and child_id are required")
+    finding_ids = _coerce_str_list(args.get("finding_ids") or [], "finding_ids", "finding ids")
     with _board(args.get("board")) as (kb, conn):
         actor_task_id = (os.environ.get("HERMES_KANBAN_TASK")
                          if _is_dispatcher_owned_worker() else None)
         kb.link_tasks(
             conn, parent_id=parent_id, child_id=child_id,
+            finding_ids=finding_ids,
             actor_task_id=actor_task_id,
             actor_run_id=_worker_run_id(actor_task_id) if actor_task_id else None,
         )
