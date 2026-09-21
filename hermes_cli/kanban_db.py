@@ -1288,8 +1288,8 @@ def create_task(
     root_task_id: Optional[str] = None,
     finding_ids: Iterable[str] = (),
     actor_task_id: Optional[str] = None, actor_run_id: Optional[int] = None,
-) -> str:
-    """Create a task (optionally under ``parents``); returns its id.
+) -> Optional[str]:
+    """Create a task (optionally under ``parents``); returns its id or ``None``.
 
     Status: ``ready`` unless a parent is not ``done`` (``todo``); ``triage=True``
     forces ``triage``; ``initial_status="blocked"`` parks it for human ops.
@@ -1305,7 +1305,9 @@ def create_task(
     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
     An orange replan subcard inherits its repair lineage from a parent and may
     be created only by that repair round's currently running Planner actor. It
-    must also name at least one durable finding from that round.
+    must also name at least one durable finding from that round. A mutation
+    beyond the configured orange depth persists one typed ``needs_input`` on
+    that Planner and returns ``None`` without creating a card or link.
     """
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
@@ -1358,10 +1360,15 @@ def create_task(
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
+        depth_limited = False
         try:
             # allow_nested: graph builders compose create_task under one outer
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
+                if _orange_depth_limit_already_blocked(
+                    conn, parents, actor_task_id=actor_task_id,
+                ):
+                    return None
                 orange_actor = _require_orange_planner_actor(
                     conn, parents, actor_task_id=actor_task_id, actor_run_id=actor_run_id,
                 )
@@ -1375,12 +1382,17 @@ def create_task(
                         return row["id"]
                 if orange_actor is not None:
                     _require_known_orange_findings(conn, orange_actor, normalized_finding_ids)
-                    repair_depth = int(orange_actor["repair_depth"] or 0)
+                    repair_depth = _orange_child_depth(conn, parents, orange_actor)
+                    if repair_depth > _orange_max_depth():
+                        _block_orange_depth_limit(conn, orange_actor, repair_depth)
+                        depth_limited = True
                     repair_round = int(orange_actor["repair_round"] or 0)
                     repair_stage = orange_actor["repair_stage"]
                     root_task_id = orange_actor["root_task_id"]
                 elif normalized_finding_ids:
                     raise ValueError("finding_ids are only valid for orange repair subcards")
+                if depth_limited:
+                    return None
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
@@ -1626,6 +1638,130 @@ def _require_orange_planner_actor(
     return planner
 
 
+def _orange_child_depth(
+    conn: sqlite3.Connection, parent_ids: Iterable[str], orange_actor: sqlite3.Row,
+) -> int:
+    """Return the next tree depth from the deepest orange parent edge."""
+    ids = tuple(dict.fromkeys(str(task_id) for task_id in parent_ids if task_id))
+    if not ids:
+        return int(orange_actor["repair_depth"] or 0) + 1
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT repair_depth, root_task_id, repair_round, repair_stage FROM tasks "
+        f"WHERE id IN ({placeholders})",
+        ids,
+    ).fetchall()
+    root_task_id = str(orange_actor["root_task_id"])
+    repair_round = int(orange_actor["repair_round"] or 0)
+    depths = [
+        int(row["repair_depth"] or 0)
+        for row in rows
+        if row["root_task_id"] == root_task_id
+        and int(row["repair_round"] or 0) == repair_round
+        and row["repair_stage"] == _ORANGE_PLANNING_STAGE
+    ]
+    return max(depths, default=int(orange_actor["repair_depth"] or 0)) + 1
+
+
+def _orange_depth_question(root_task_id: str, repair_round: int, attempted_depth: int) -> dict:
+    """Build the deterministic Human Wait payload for an exhausted depth budget."""
+    from tools.human_question_contract import HUMAN_QUESTION_SCHEMA, canonical_sha256
+
+    max_depth = _orange_max_depth()
+    question_key = canonical_sha256({
+        "kind": "orange-depth-limit", "root_task_id": root_task_id,
+        "repair_round": repair_round, "attempted_depth": attempted_depth,
+    })[:16]
+    body = {
+        "schema_version": HUMAN_QUESTION_SCHEMA,
+        "question_id": f"orange-depth-{question_key}",
+        "audience": "HUMAN",
+        "prompt": (
+            f"Orange repair for {root_task_id} reached depth {max_depth}. "
+            f"Approve planning beyond depth {max_depth}, or stop this repair tree?"
+        ),
+        "answer_kind": "CHOICE",
+        "choices": ["Approve deeper planning", "Stop this repair tree"],
+        "required": True,
+        "context": (
+            f"root_task_id={root_task_id}; repair_round={repair_round}; "
+            f"attempted_depth={attempted_depth}; max_depth={max_depth}"
+        ),
+    }
+    return {**body, "question_sha256": canonical_sha256(body)}
+
+
+def _orange_depth_limit_already_blocked(
+    conn: sqlite3.Connection, parent_ids: Iterable[str], *, actor_task_id: Optional[str],
+) -> bool:
+    """Recognize the same persisted depth stop before rejecting a replayed create."""
+    ids = tuple(dict.fromkeys(str(task_id) for task_id in parent_ids if task_id))
+    if not ids:
+        return False
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT root_task_id, repair_round, repair_depth, repair_stage FROM tasks "
+        f"WHERE id IN ({placeholders})",
+        ids,
+    ).fetchall()
+    orange_rows = [row for row in rows if row["root_task_id"] and row["repair_stage"] == _ORANGE_PLANNING_STAGE]
+    rounds = {(str(row["root_task_id"]), int(row["repair_round"] or 0)) for row in orange_rows}
+    if len(rounds) != 1:
+        return False
+    root_task_id, repair_round = next(iter(rounds))
+    attempted_depth = max(int(row["repair_depth"] or 0) for row in orange_rows) + 1
+    if attempted_depth <= _orange_max_depth():
+        return False
+    question = _orange_depth_question(root_task_id, repair_round, attempted_depth)
+    row = conn.execute(
+        """
+        SELECT p.id
+          FROM tasks AS p
+          JOIN task_human_questions AS q ON q.task_id = p.id AND q.question_id = ?
+         WHERE p.assignee = 'planner' AND p.status = 'blocked' AND p.block_kind = 'needs_input'
+           AND p.root_task_id = ? AND p.repair_round = ? AND p.repair_stage = ?
+           AND (? IS NULL OR p.id = ?)
+         LIMIT 1
+        """,
+        (
+            question["question_id"], root_task_id, repair_round, _ORANGE_PLANNING_STAGE,
+            actor_task_id, actor_task_id,
+        ),
+    ).fetchone()
+    return row is not None
+
+
+def _block_orange_depth_limit(
+    conn: sqlite3.Connection, orange_actor: sqlite3.Row, attempted_depth: int,
+) -> None:
+    """Persist one typed needs-input stop while the Planner transaction is live."""
+    planner_id = str(orange_actor["id"])
+    root_task_id = str(orange_actor["root_task_id"])
+    repair_round = int(orange_actor["repair_round"] or 0)
+    question = _orange_depth_question(root_task_id, repair_round, attempted_depth)
+    reason = "orange repair depth limit reached; human input is required"
+    source_status = _retry_status_for_run(conn, planner_id)
+    _, event_kind, _, params, payload = _route_block(
+        "needs_input", reason, source_status, prev_kind=None, prev_recurrences=0,
+    )
+    changed = conn.execute(
+        """
+        UPDATE tasks
+           SET status = 'blocked', claim_lock = NULL, claim_expires = NULL, worker_pid = NULL,
+               block_kind = ?, block_recurrences = ?
+         WHERE id = ? AND status = 'running' AND current_run_id = ?
+        """,
+        (*params, planner_id, int(orange_actor["current_run_id"])),
+    ).rowcount
+    if changed != 1:
+        raise RuntimeError("orange depth Planner state changed during transition")
+    payload["human_question"] = _persist_human_question(conn, planner_id, root_task_id, question)
+    run_id = _end_run(conn, planner_id, outcome="blocked", status="blocked", summary=reason)
+    if run_id is None:
+        raise RuntimeError("orange depth Planner run disappeared during transition")
+    _append_event(conn, planner_id, event_kind, payload, run_id=run_id)
+
+
 def _missing_task_ids(conn: sqlite3.Connection, ids: Iterable[str]) -> list[str]:
     """Subset of ``ids`` (order kept) with no ``tasks`` row."""
     ids = list(ids)
@@ -1806,7 +1942,7 @@ def link_tasks(
     conn: sqlite3.Connection, parent_id: str, child_id: str, *,
     finding_ids: Iterable[str] = (),
     actor_task_id: Optional[str] = None, actor_run_id: Optional[int] = None,
-) -> None:
+) -> bool:
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
     normalized_finding_ids = _normalize_orange_finding_ids(finding_ids)
@@ -1814,34 +1950,66 @@ def link_tasks(
         missing = _missing_task_ids(conn, [parent_id, child_id])
         if missing:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
+        if _orange_depth_limit_already_blocked(
+            conn, (parent_id,), actor_task_id=actor_task_id,
+        ):
+            return False
         orange_actor = _require_orange_planner_actor(
             conn, (parent_id, child_id), actor_task_id=actor_task_id, actor_run_id=actor_run_id,
         )
         child_row = conn.execute(
             "SELECT root_task_id FROM tasks WHERE id = ?", (child_id,),
         ).fetchone()
+        parent_row = conn.execute(
+            "SELECT root_task_id, repair_round, repair_stage FROM tasks WHERE id = ?", (parent_id,),
+        ).fetchone()
+        child_depth = None
         if orange_actor is not None:
             if child_row is not None and not child_row["root_task_id"] and not normalized_finding_ids:
                 raise ValueError("orange repair subcards require non-empty finding_ids")
             if normalized_finding_ids:
                 _require_known_orange_findings(conn, orange_actor, normalized_finding_ids)
+            if (
+                child_row is not None and not child_row["root_task_id"]
+                and parent_row is not None
+                and parent_row["root_task_id"] == orange_actor["root_task_id"]
+                and int(parent_row["repair_round"] or 0) == int(orange_actor["repair_round"] or 0)
+                and parent_row["repair_stage"] == _ORANGE_PLANNING_STAGE
+            ):
+                child_depth = _orange_child_depth(conn, (parent_id,), orange_actor)
+                if child_depth > _orange_max_depth():
+                    _block_orange_depth_limit(conn, orange_actor, child_depth)
+                    return False
         elif normalized_finding_ids:
             raise ValueError("finding_ids are only valid for orange repair subcards")
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
         _link(conn, parent_id, child_id)
         if orange_actor is not None:
-            conn.execute(
-                """
-                UPDATE tasks
-                   SET repair_depth = ?, repair_round = ?, repair_stage = ?, root_task_id = ?
-                 WHERE id IN (?, ?) AND root_task_id IS NULL
-                """,
-                (
-                    int(orange_actor["repair_depth"] or 0), int(orange_actor["repair_round"] or 0),
-                    orange_actor["repair_stage"], orange_actor["root_task_id"], parent_id, child_id,
-                ),
-            )
+            if child_depth is not None:
+                conn.execute(
+                    """
+                    UPDATE tasks
+                       SET repair_depth = ?, repair_round = ?, repair_stage = ?, root_task_id = ?
+                     WHERE id = ? AND root_task_id IS NULL
+                    """,
+                    (
+                        child_depth, int(orange_actor["repair_round"] or 0),
+                        orange_actor["repair_stage"], orange_actor["root_task_id"], child_id,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE tasks
+                       SET repair_depth = ?, repair_round = ?, repair_stage = ?, root_task_id = ?
+                     WHERE id IN (?, ?) AND root_task_id IS NULL
+                    """,
+                    (
+                        int(orange_actor["repair_depth"] or 0), int(orange_actor["repair_round"] or 0),
+                        orange_actor["repair_stage"], orange_actor["root_task_id"], parent_id, child_id,
+                    ),
+                )
             if normalized_finding_ids:
                 _bind_orange_findings(conn, orange_actor, child_id, normalized_finding_ids)
         # If child was ready but parent is not yet done, demote child to todo.
@@ -1853,6 +2021,7 @@ def link_tasks(
             conn, child_id, "linked", {"parent": parent_id, "child": child_id},
         )
         _inherit_notify_subs(conn, child_id, (parent_id,))
+    return True
 
 
 def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
@@ -2545,6 +2714,17 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         if payload.get(key) == "review":
             return "review"
     return "ready"
+
+
+def _orange_max_depth() -> int:
+    """Configured, fail-closed maximum depth for orange repair subcards."""
+    from hermes_cli.config import cfg_get, load_config_readonly
+
+    raw = cfg_get(load_config_readonly(), "kanban", "max_depth", default=3)
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return 3
 
 
 def _orange_max_rewrites() -> int:

@@ -910,6 +910,11 @@ def _handle_create(args: dict, **kw) -> str:
             created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id,
             finding_ids=finding_ids,
             actor_task_id=self_tid, actor_run_id=_worker_run_id(self_tid) if self_tid else None)
+        if new_tid is None:
+            return json.dumps({
+                "ok": False, "task_id": self_tid,
+                "reason": "orange repair depth limit reached; human input is required",
+            })
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         return _ok(task_id=new_tid, **landed, subscribed=_maybe_auto_subscribe(conn, new_tid))
 
@@ -1049,12 +1054,17 @@ def _handle_link(args: dict, **kw) -> str:
     with _board(args.get("board")) as (kb, conn):
         actor_task_id = (os.environ.get("HERMES_KANBAN_TASK")
                          if _is_dispatcher_owned_worker() else None)
-        kb.link_tasks(
+        linked = kb.link_tasks(
             conn, parent_id=parent_id, child_id=child_id,
             finding_ids=finding_ids,
             actor_task_id=actor_task_id,
             actor_run_id=_worker_run_id(actor_task_id) if actor_task_id else None,
         )
+        if not linked:
+            return json.dumps({
+                "ok": False, "parent_id": parent_id, "child_id": child_id,
+                "reason": "orange repair depth limit reached; human input is required",
+            })
         return _ok(parent_id=parent_id, child_id=child_id)
 
 

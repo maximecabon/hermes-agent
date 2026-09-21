@@ -559,3 +559,157 @@ def test_orange_allows_two_root_waves_then_blocks_the_third_without_spawning(tmp
         )
         assert conn.execute("SELECT COUNT(*) AS count FROM tasks").fetchone()["count"] == task_count
         assert conn.execute("SELECT COUNT(*) AS count FROM task_runs").fetchone()["count"] == run_count
+
+
+def test_orange_subcard_depth_stops_at_three_with_one_typed_human_question(tmp_path: Path) -> None:
+    """A fourth orange subcard is refused without a task/link orphan or duplicate question."""
+    with kbc.connect_closing(tmp_path / "kanban.db") as conn:
+        source_id = kb.create_task(
+            conn,
+            title="Depth root",
+            assignee="builder",
+            repair_depth=0,
+            repair_round=1,
+            repair_stage="VERIFY",
+            root_task_id="t_depth_root",
+        )
+        source = kb.claim_task(conn, source_id, claimer="builder:depth-root")
+        assert source is not None
+        planner_id = kb.needs_replan(
+            conn, source_id, findings=["DEPTH-001"], expected_run_id=source.current_run_id,
+        )
+        assert planner_id is not None
+        planner = kb.claim_task(conn, planner_id, claimer="planner:depth")
+        assert planner is not None
+        assert planner.current_run_id is not None
+
+        parent_id = planner_id
+        for depth in range(1, 4):
+            parent_id = kb.create_task(
+                conn,
+                title=f"Depth {depth}",
+                assignee="builder",
+                parents=[parent_id],
+                finding_ids=["DEPTH-001"],
+                actor_task_id=planner_id,
+                actor_run_id=planner.current_run_id,
+            )
+            child = kb.get_task(conn, parent_id)
+            assert child is not None
+            assert child.repair_depth == depth
+
+        task_count = conn.execute("SELECT COUNT(*) AS count FROM tasks").fetchone()["count"]
+        link_count = conn.execute("SELECT COUNT(*) AS count FROM task_links").fetchone()["count"]
+
+        assert kb.create_task(
+            conn,
+            title="Depth 4",
+            assignee="builder",
+            parents=[parent_id],
+            finding_ids=["DEPTH-001"],
+            actor_task_id=planner_id,
+            actor_run_id=planner.current_run_id,
+        ) is None
+
+        planner_row = conn.execute(
+            "SELECT status, block_kind FROM tasks WHERE id = ?", (planner_id,),
+        ).fetchone()
+        questions = conn.execute(
+            "SELECT question_id FROM task_human_questions WHERE task_id = ?", (planner_id,),
+        ).fetchall()
+        events = [event for event in kb.list_events(conn, planner_id) if event.kind == "blocked"]
+
+        assert planner_row is not None
+        assert (planner_row["status"], planner_row["block_kind"]) == ("blocked", "needs_input")
+        assert conn.execute("SELECT COUNT(*) AS count FROM tasks").fetchone()["count"] == task_count
+        assert conn.execute("SELECT COUNT(*) AS count FROM task_links").fetchone()["count"] == link_count
+        assert len(questions) == 1
+        assert len(events) == 1
+        question = kb.get_human_question(conn, planner_id, questions[0]["question_id"])
+        assert question is not None
+        assert question["root_task_id"] == "t_depth_root"
+        assert question["question"]["answer_kind"] == "CHOICE"
+        assert question["question"]["required"] is True
+
+        assert kb.create_task(
+            conn,
+            title="Depth 4 replay",
+            assignee="builder",
+            parents=[parent_id],
+            finding_ids=["DEPTH-001"],
+            actor_task_id=planner_id,
+            actor_run_id=planner.current_run_id,
+        ) is None
+
+        assert conn.execute("SELECT COUNT(*) AS count FROM tasks").fetchone()["count"] == task_count
+        assert conn.execute("SELECT COUNT(*) AS count FROM task_links").fetchone()["count"] == link_count
+        assert conn.execute(
+            "SELECT COUNT(*) AS count FROM task_human_questions WHERE task_id = ?", (planner_id,),
+        ).fetchone()["count"] == 1
+        assert len([event for event in kb.list_events(conn, planner_id) if event.kind == "blocked"]) == 1
+
+
+def test_orange_depth_limit_refuses_a_link_without_persisting_an_orphan(tmp_path: Path) -> None:
+    with kbc.connect_closing(tmp_path / "kanban.db") as conn:
+        source_id = kb.create_task(
+            conn,
+            title="Link depth root",
+            assignee="builder",
+            repair_depth=0,
+            repair_round=1,
+            repair_stage="VERIFY",
+            root_task_id="t_link_depth_root",
+        )
+        source = kb.claim_task(conn, source_id, claimer="builder:link-depth-root")
+        assert source is not None
+        planner_id = kb.needs_replan(
+            conn, source_id, findings=["LINK-DEPTH-001"], expected_run_id=source.current_run_id,
+        )
+        assert planner_id is not None
+        planner = kb.claim_task(conn, planner_id, claimer="planner:link-depth")
+        assert planner is not None
+        assert planner.current_run_id is not None
+
+        parent_id = planner_id
+        for depth in range(1, 4):
+            parent_id = kb.create_task(
+                conn,
+                title=f"Link depth {depth}",
+                assignee="builder",
+                parents=[parent_id],
+                finding_ids=["LINK-DEPTH-001"],
+                actor_task_id=planner_id,
+                actor_run_id=planner.current_run_id,
+            )
+        ordinary_child = kb.create_task(conn, title="Unlinked level four")
+        link_count = conn.execute("SELECT COUNT(*) AS count FROM task_links").fetchone()["count"]
+
+        assert kb.link_tasks(
+            conn,
+            parent_id=parent_id,
+            child_id=ordinary_child,
+            finding_ids=["LINK-DEPTH-001"],
+            actor_task_id=planner_id,
+            actor_run_id=planner.current_run_id,
+        ) is False
+        assert kb.parent_ids(conn, ordinary_child) == []
+        assert conn.execute("SELECT COUNT(*) AS count FROM task_links").fetchone()["count"] == link_count
+        assert conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (planner_id,),
+        ).fetchone()["status"] == "blocked"
+        assert conn.execute(
+            "SELECT COUNT(*) AS count FROM task_human_questions WHERE task_id = ?", (planner_id,),
+        ).fetchone()["count"] == 1
+
+        assert kb.link_tasks(
+            conn,
+            parent_id=parent_id,
+            child_id=ordinary_child,
+            finding_ids=["LINK-DEPTH-001"],
+            actor_task_id=planner_id,
+            actor_run_id=planner.current_run_id,
+        ) is False
+        assert kb.parent_ids(conn, ordinary_child) == []
+        assert conn.execute(
+            "SELECT COUNT(*) AS count FROM task_human_questions WHERE task_id = ?", (planner_id,),
+        ).fetchone()["count"] == 1
