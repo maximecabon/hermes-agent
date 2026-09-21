@@ -835,6 +835,14 @@ _NOTIFY_SUB_COLUMNS = (
     ("delivery_metadata", "delivery_metadata TEXT"),
 )
 
+# Latest-only activity is deliberately additive and nullable: boards and runs
+# created before this projection retain their exact former semantics.
+_LATER_RUN_COLUMNS = (
+    ("activity_json", "activity_json TEXT"),
+    ("activity_updated_at", "activity_updated_at INTEGER"),
+    ("activity_sequence", "activity_sequence INTEGER"),
+)
+
 
 def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -906,6 +914,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 )
 
     if _table_exists(conn, "task_runs"):
+        run_cols = _column_names(conn, "task_runs")
+        for name, ddl in _LATER_RUN_COLUMNS:
+            if name not in run_cols:
+                _add_column_if_missing(conn, "task_runs", name, ddl)
         _backfill_legacy_inflight_runs(conn)
 
     # One-shot event-kind rename: old names still worked but were awkward on
@@ -1008,7 +1020,8 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT)",
+        " error TEXT, activity_json TEXT, activity_updated_at INTEGER,"
+        " activity_sequence INTEGER)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",

@@ -95,6 +95,7 @@ class ActivityTrackingMixin:
             self._turn_liveness_activity_generation = (
                 getattr(self, "_turn_liveness_activity_generation", 0) + 1
             )
+            activity_sequence = self._turn_liveness_activity_generation
             self._last_activity_ts = time.time()
             self._last_activity_desc = bound_activity_description(desc)
             self._last_activity_provenance = normalize_activity_provenance(provenance)
@@ -107,7 +108,15 @@ class ActivityTrackingMixin:
                 from tools.kanban_tools import (
                     heartbeat_current_worker_from_env, inject_new_comments_from_env
                 )
-                heartbeat_current_worker_from_env()
+                heartbeat_attempted = heartbeat_current_worker_from_env()
+                if heartbeat_attempted:
+                    # Reuse the auto-heartbeat's 60s process cadence. The
+                    # persistence bridge is opt-in and fail-open; its CAS
+                    # fences late callbacks from reclaimed/retried runs.
+                    from hermes_cli.kanban_db_dispatch import persist_current_worker_activity_snapshot
+                    persist_current_worker_activity_snapshot(
+                        build_standard_agent_activity_snapshot(self), sequence=activity_sequence,
+                    )
                 # Fold new operator notes into the running turn (OUT-OF-BAND steer).
                 inject_new_comments_from_env(self)
         if force_persist:

@@ -778,6 +778,11 @@ class Run:
     summary: Optional[str]
     metadata: Optional[dict]
     error: Optional[str]
+    # Latest-only, opt-in worker activity projection. Kept separate from
+    # immutable handoff metadata and fenced by a per-run sequence.
+    activity_json: Optional[dict]
+    activity_updated_at: Optional[int]
+    activity_sequence: Optional[int]
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
@@ -792,6 +797,9 @@ class Run:
             started_at=int(row["started_at"]),
             ended_at=_opt_int(row["ended_at"]),
             metadata=_json_or(row["metadata"]),
+            activity_json=_json_or(_row_get(row, "activity_json")),
+            activity_updated_at=_opt_int(_row_get(row, "activity_updated_at")),
+            activity_sequence=_opt_int(_row_get(row, "activity_sequence")),
         )
 
 
@@ -1042,7 +1050,12 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Latest agent_activity/v1 snapshot. NULL preserves legacy/off behavior;
+    -- sequence fences out-of-order activity callbacks for the same run.
+    activity_json       TEXT,
+    activity_updated_at INTEGER,
+    activity_sequence   INTEGER
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob

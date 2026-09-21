@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import signal
@@ -414,6 +415,70 @@ def _defer_reclaim_for_live_worker(
         payload = {"reason": reason, "claim_lock": claim_lock, "claim_expires_now": grace}
         payload.update(termination)
         _kb._append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
+
+
+def persist_run_activity_snapshot(
+    conn: sqlite3.Connection,
+    task_id: str,
+    snapshot: Mapping[str, Any],
+    *,
+    sequence: int,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Replace the active run snapshot iff its sequence advances.
+
+    Equal sequences are idempotent no-ops and an older callback cannot overwrite
+    newer state. The active-run predicate fences reclaimed or retried workers
+    without changing task lifecycle state.
+    """
+    try:
+        sequence = int(sequence)
+        if sequence < 0:
+            return False
+        payload = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    now = int(time.time())
+    with _kb.write_txn(conn):
+        run_id = int(expected_run_id) if expected_run_id is not None else _kb._current_run_id(conn, task_id)
+        if run_id is None:
+            return False
+        cur = conn.execute(
+            """
+            UPDATE task_runs
+               SET activity_json = ?, activity_updated_at = ?, activity_sequence = ?
+             WHERE id = ?
+               AND ended_at IS NULL
+               AND (activity_sequence IS NULL OR activity_sequence < ?)
+               AND EXISTS (
+                   SELECT 1 FROM tasks
+                    WHERE id = ? AND status = 'running' AND current_run_id = task_runs.id
+               )
+            """,
+            (payload, now, sequence, run_id, sequence, task_id),
+        )
+        return cur.rowcount == 1
+
+
+def persist_current_worker_activity_snapshot(snapshot: Mapping[str, Any], *, sequence: int) -> bool:
+    """Best-effort, opt-in bridge for dispatcher-owned workers; never raises."""
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if not task_id:
+        return False
+    try:
+        from hermes_cli.config import load_config_readonly
+        if not bool((load_config_readonly().get("kanban") or {}).get("persist_run_activity", False)):
+            return False
+        from hermes_cli.kanban_db_connect import connect_closing
+        raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+        expected_run_id = int(raw_run_id) if raw_run_id else None
+        with connect_closing() as conn:
+            return persist_run_activity_snapshot(
+                conn, task_id, snapshot, sequence=sequence, expected_run_id=expected_run_id,
+            )
+    except Exception:
+        _kb._log.debug("kanban run activity snapshot write failed (ignored)", exc_info=True)
+        return False
 
 
 def heartbeat_worker(

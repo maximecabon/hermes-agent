@@ -1747,6 +1747,9 @@ DEFAULT_CONFIG = {
         "review_dispatch": True,
         # Seconds between dispatcher ticks. Lower = snappier pickup; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
+        # Persist a bounded agent_activity/v1 snapshot on the active task run.
+        # Off by default: observation only, with no extra lifecycle behavior.
+        "persist_run_activity": False,
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
         # crashed) for the same task/profile. Reassignment resets the streak.
         "failure_limit": 2,
