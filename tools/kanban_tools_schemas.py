@@ -528,6 +528,26 @@ KANBAN_UNBLOCK_SCHEMA = _schema(
     ["task_id"],
 )
 
+KANBAN_RESUME_HUMAN_ANSWER_SCHEMA = _schema(
+    "kanban_resume_human_answer",
+    (
+        "Resume a needs_input Kanban task from one closed, correlated HumanAnswer. "
+        "The answer must bind its answer_id, task_id, root_task_id, question_id "
+        "and question_sha256 to the persisted typed question. Replays of the same "
+        "answer_id are idempotent and never claim or spawn a second worker. "
+        "Orchestrator-only."
+    ),
+    {
+        "task_id": _prop("string", "Blocked needs_input task to resume."),
+        "answer": _prop("object", (
+            "Required closed HumanAnswer: schema_version='kanban.human_answer.v1', "
+            "answer_id, task_id, root_task_id, question_id, question_sha256, "
+            "answer_kind, status, value and canonical answer_sha256."
+        )),
+    },
+    ["task_id", "answer"],
+)
+
 KANBAN_LINK_SCHEMA = _schema(
     "kanban_link",
     (

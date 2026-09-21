@@ -24,7 +24,7 @@ from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
-    KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
+    KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA, KANBAN_RESUME_HUMAN_ANSWER_SCHEMA)
 
 logger = logging.getLogger(__name__)
 
@@ -1000,6 +1000,22 @@ def _handle_unblock(args: dict, **kw) -> str:
         return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status",)))
 
 
+@_kanban_handler("kanban_resume_human_answer")
+def _handle_resume_human_answer(args: dict, **kw) -> str:
+    """Resume the stored repair checkpoint without claiming a worker."""
+    _reject_delegated_child_mutation("kanban_resume_human_answer")
+    _require_orchestrator_tool("kanban_resume_human_answer")
+    tid = args.get("task_id")
+    _check(tid, "task_id is required")
+    _check(args.get("answer") is not None, "answer is required")
+    tid = str(tid)
+    with _board(args.get("board")) as (kb, conn):
+        resumed = kb.resume_human_answer(conn, tid, args["answer"])
+        task = kb.get_task(conn, tid)
+        _check(task is not None, f"task {tid} not found")
+        return _ok(task_id=tid, status=task.status, resumed=resumed)
+
+
 @_kanban_handler("kanban_link")
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact (cycles/self-links → ValueError)."""
@@ -1014,8 +1030,8 @@ def _handle_link(args: dict, **kw) -> str:
 
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
-# kanban_list / kanban_unblock route the board and are hidden from task workers.
-_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock"})
+# Board routing and human-answer admission are hidden from task workers.
+_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock", "kanban_resume_human_answer"})
 _TOOLS = (
     ("kanban_show", KANBAN_SHOW_SCHEMA, _handle_show, "📋"),
     ("kanban_list", KANBAN_LIST_SCHEMA, _handle_list, "📋"),
@@ -1030,6 +1046,7 @@ _TOOLS = (
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
+    ("kanban_resume_human_answer", KANBAN_RESUME_HUMAN_ANSWER_SCHEMA, _handle_resume_human_answer, "▶"),
     ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:
